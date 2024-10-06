@@ -57,4 +57,8 @@ coverage/
 *.out
 *.so
 
-enhanced_custom_model_final/
+new_model/enhanced_custom_model_v2_best
+new_model/enhanced_custom_model_v2_final
+test_results/
+enhanced_custom_model_v2_best/
+enhanced_custom_model_v2_final/

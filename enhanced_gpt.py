@@ -11,7 +11,27 @@ import math
 from torch.nn import functional as F
 import gc
 import traceback
+from typing import List, Optional, Union
+from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteriaList, StoppingCriteria
 #### 2'ND ATTEMPT
+class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
+    def __init__(self, penalty: float):
+        self.penalty = penalty
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        score = torch.gather(scores, 1, input_ids)
+        score = torch.where(score < 0, score * self.penalty, score / self.penalty)
+        scores.scatter_(1, input_ids, score)
+        return scores
+    
+class MaxLengthCriteria(StoppingCriteria):
+    def __init__(self, max_length: int):
+        self.max_length = max_length
+
+    def __call__(self, input_ids: torch.LongTensor, scores: Optional[torch.FloatTensor] = None) -> bool:
+        return input_ids.shape[-1] >= self.max_length
+    
+
 class EnhancedCustomConfigV2(PretrainedConfig):
     model_type = "enhanced_custom_v2"
 
@@ -209,17 +229,28 @@ class ThoughtLayer(nn.Module):
             x = self.activation(self.transform(x))
         return x + original_x
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class MixtureOfExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_moe_experts
         self.top_k = config.moe_top_k
-        self.experts = nn.ModuleList([GatedFeedForward(config) for _ in range(self.num_experts)])
+        self.hidden_size = config.hidden_size
+        self.experts = nn.ModuleList([nn.Sequential(
+            nn.Linear(config.hidden_size, config.intermediate_size),
+            nn.GELU(),
+            nn.Linear(config.intermediate_size, config.hidden_size)
+        ) for _ in range(self.num_experts)])
         self.gate = nn.Linear(config.hidden_size, self.num_experts)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, x):
         # x shape: [batch_size, seq_len, hidden_size]
-        batch_size, seq_len, hidden_size = x.shape
+        batch_size, seq_len, _ = x.shape
         
         # Compute expert weights
         expert_weights = F.softmax(self.gate(x), dim=-1)
@@ -233,29 +264,27 @@ class MixtureOfExperts(nn.Module):
         # Normalize top-k weights
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
         
-        # Initialize output tensor
-        output = torch.zeros_like(x)
-        
-        # Apply each expert
-        for i, expert in enumerate(self.experts):
-            # Create a mask for the current expert
-            mask = (top_k_indices == i).any(dim=-1)  # shape: [batch_size, seq_len]
+        # Combine expert outputs
+        combined_output = torch.zeros_like(x)
+        for k in range(self.top_k):
+            expert_idx = top_k_indices[:, :, k]
+            expert_weight = top_k_weights[:, :, k].unsqueeze(-1)
             
-            if mask.any():
-                # Select the inputs for this expert
-                expert_input = x[mask]
-                
-                # Apply the expert
-                expert_output = expert(expert_input)
-                
-                # Get the weights for this expert
-                expert_weights = top_k_weights[mask][top_k_indices[mask] == i]
-                
-                # Add the weighted output to the result
-                output[mask] += expert_weights.unsqueeze(-1) * expert_output
+            for i in range(self.num_experts):
+                # Create a mask for the current expert
+                expert_mask = (expert_idx == i)
+                if expert_mask.any():
+                    # Select inputs for this expert
+                    expert_input = x[expert_mask]
+                    # Apply the expert
+                    expert_output = self.experts[i](expert_input)
+                    # Add the weighted output to the result
+                    combined_output[expert_mask] += expert_weight[expert_mask] * expert_output
         
-        return output
-
+        # Apply dropout and layer normalization
+        output = self.dropout(combined_output)
+        return self.layer_norm(x + output)
+    
 class DynamicNTKLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -362,7 +391,7 @@ class EnhancedCustomModelV2(PreTrainedModel):
         labels=None,
         output_attentions=None,
         output_hidden_states=None,
-        return_dict=None,
+        return_dict=True,
     ):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -414,34 +443,102 @@ class EnhancedCustomModelV2(PreTrainedModel):
             'pooled_output': pooled_output,
             'hidden_states': hidden_states,
         }
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_length: int = 50,
+        min_length: int = 10,
+        do_sample: bool = True,
+        num_beams: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        length_penalty: float = 1.0,
+        pad_token_id: int = None,
+        eos_token_id: int = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> torch.LongTensor:
+        """
+        Generate text based on input_ids.
+        """
+        # Set default token IDs if not provided
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        
+        # Initialize variables
+        batch_size = input_ids.shape[0]
+        cur_len = input_ids.shape[1]
+        
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        
+        while cur_len < max_length:
+            # Prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, attention_mask=attention_mask)
+            
+            # Forward pass
+            outputs = self(**model_inputs)
+            next_token_logits = outputs['logits'][:, -1, :]
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for i in range(batch_size):
+                    for previous_token in set(input_ids[i].tolist()):
+                        next_token_logits[i, previous_token] /= repetition_penalty
+            
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
+            
+            # Apply top-k filtering
+            if top_k > 0:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = float('-inf')
+            
+            # Apply top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                for batch_idx in range(batch_size):
+                    indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
+                    next_token_logits[batch_idx, indices_to_remove] = float('-inf')
+            
+            # Sample next token
+            if do_sample:
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_logits, dim=-1)
+            
+            # Finished sentences should have their next token be a padding token
+            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+            
+            # Update input_ids and attention_mask
+            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(-1)], dim=-1)
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1)
+            
+            # Update unfinished sequences
+            unfinished_sequences = unfinished_sequences.mul(next_tokens.ne(eos_token_id).long())
+            
+            # Stop when there are no sequences to generate
+            if unfinished_sequences.max() == 0:
+                break
+            
+            cur_len = cur_len + 1
+        
+        return input_ids
 
-def save_enhanced_custom_model_v2(model, tokenizer, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-
-    model.config.save_pretrained(output_dir)
-
-    state_dict = model.state_dict()
-    
-    if 'lm_head.weight' in state_dict and 'embeddings.word_embeddings.weight' in state_dict:
-        if torch.equal(state_dict['lm_head.weight'], state_dict['embeddings.word_embeddings.weight']):
-            del state_dict['lm_head.weight']
-    
-    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
-
-    tokenizer.save_pretrained(output_dir)
-
-    custom_components = {
-        "tree_layers": [layer.tree.state_dict() for layer in model.encoder],
-        "thought_layers": [layer.thought.state_dict() for layer in model.encoder],
-        "moe_layers": [layer.moe.state_dict() for layer in model.encoder if hasattr(layer, 'moe')],
-        "dynamic_ntk_layers": [layer.dynamic_ntk.state_dict() for layer in model.encoder if hasattr(layer, 'dynamic_ntk')]
-    }
-    torch.save(custom_components, os.path.join(output_dir, "custom_components.pt"))
-
-    with open(os.path.join(output_dir, "tied_weights_info.json"), "w") as f:
-        json.dump({"lm_head_tied_to_embeddings": True}, f)
-
-    print(f"Model saved to {output_dir}")
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
 
 def evaluate_v2(model, eval_loader, device):
     model.eval()
@@ -461,31 +558,48 @@ def train_enhanced_custom_model_v2(model, dataset, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
+    # Create a validation dataset
+    dataset_size = len(dataset)
+    train_size = int(0.9 * dataset_size)
+    val_size = dataset_size - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
     train_loader = torch.utils.data.DataLoader(
-        dataset, 
+        train_dataset, 
         batch_size=config.batch_size, 
-        shuffle=True, 
-        num_workers=2, 
-        pin_memory=True,
-        drop_last=True  # Prevent issues with last batch having different size
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
     )
 
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=config.learning_rate, 
-        weight_decay=0.01, 
-        betas=(0.9, 0.999), 
+        lr=config.learning_rate,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
         eps=1e-8
     )
     
     num_training_steps = len(train_loader) * config.epochs
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, 
-        num_warmup_steps=config.warmup_steps, 
+        optimizer,
+        num_warmup_steps=config.warmup_steps,
         num_training_steps=num_training_steps
     )
     
     scaler = GradScaler(enabled=(device.type == "cuda"))
+    
+    best_val_loss = float('inf')
+    patience = 3
+    patience_counter = 0
 
     for epoch in range(config.epochs):
         model.train()
@@ -493,60 +607,76 @@ def train_enhanced_custom_model_v2(model, dataset, config):
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]")
         
         for i, batch in enumerate(train_pbar):
+            optimizer.zero_grad(set_to_none=True)
+            
             try:
                 input_ids = batch['input_ids'].squeeze(1).to(device)
                 attention_mask = batch['attention_mask'].squeeze(1).to(device)
                 
-                # Ensure input dimensions are correct
-                if input_ids.dim() == 1:
-                    input_ids = input_ids.unsqueeze(0)
-                if attention_mask.dim() == 1:
-                    attention_mask = attention_mask.unsqueeze(0)
+                # Create shifted labels for next token prediction
+                labels = input_ids.clone()
+                labels = torch.roll(labels, shifts=-1, dims=1)
+                labels[:, -1] = -100  # Ignore last token prediction
                 
                 with autocast(device_type=device.type, dtype=torch.float16):
-                    outputs = model(input_ids, attention_mask=attention_mask, labels=input_ids)
+                    outputs = model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
                     loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
-                    loss = loss / config.accumulation_steps
-
+                
                 scaler.scale(loss).backward()
+                
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
 
-                if (i + 1) % config.accumulation_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-
-                total_loss += loss.item() * config.accumulation_steps
+                total_loss += loss.item()
                 train_pbar.set_postfix({
-                    'loss': loss.item() * config.accumulation_steps,
+                    'loss': loss.item(),
                     'lr': scheduler.get_last_lr()[0]
                 })
 
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"CUDA out of memory in batch {i}. Skipping batch and clearing cache.")
-                    if hasattr(torch.cuda, 'empty_cache'):
-                        torch.cuda.empty_cache()
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                else:
-                    print(f"Error in batch {i}: {str(e)}")
-                    traceback.print_exc()
-                    continue
+                print(f"Error in batch {i}: {str(e)}")
+                continue
 
-            # Clean up to prevent memory leaks
-            del input_ids, attention_mask, outputs, loss
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+        avg_train_loss = total_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validating"):
+                input_ids = batch['input_ids'].squeeze(1).to(device)
+                attention_mask = batch['attention_mask'].squeeze(1).to(device)
+                labels = input_ids.clone()
+                labels = torch.roll(labels, shifts=-1, dims=1)
+                labels[:, -1] = -100
+                
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
+                val_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{config.epochs}, Train Loss: {avg_loss:.4f}")
-
-        gc.collect()
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        avg_val_loss = val_loss / len(val_loader)
+        
+        print(f"Epoch {epoch+1}/{config.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            save_enhanced_custom_model_v2(model, None, f"enhanced_custom_model_v2_best")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
 
     return model
 
@@ -565,15 +695,54 @@ class WikipediaDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx):
-        return self.tokenizer(self.data[idx], max_length=self.max_length, truncation=True, padding='max_length', return_tensors="pt")
+        # GPT-2 tokenization process
+        return self.tokenizer(
+            self.data[idx],
+            max_length=self.max_length,
+            truncation=True,
+            padding='max_length',  
+            return_tensors="pt"
+        )
  
+def save_enhanced_custom_model_v2(model, tokenizer, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+    model.config.save_pretrained(output_dir)
+
+    state_dict = model.state_dict()
+    
+    if 'lm_head.weight' in state_dict and 'embeddings.word_embeddings.weight' in state_dict:
+        if torch.equal(state_dict['lm_head.weight'], state_dict['embeddings.word_embeddings.weight']):
+            del state_dict['lm_head.weight']
+    
+    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+
+    if tokenizer is not None:
+        tokenizer.save_pretrained(output_dir)
+    else:
+        print("Tokenizer not provided. Skipping tokenizer saving.")
+
+    custom_components = {
+        "tree_layers": [layer.tree.state_dict() for layer in model.encoder],
+        "thought_layers": [layer.thought.state_dict() for layer in model.encoder],
+        "moe_layers": [layer.moe.state_dict() for layer in model.encoder if hasattr(layer, 'moe')],
+        "dynamic_ntk_layers": [layer.dynamic_ntk.state_dict() for layer in model.encoder if hasattr(layer, 'dynamic_ntk')]
+    }
+    torch.save(custom_components, os.path.join(output_dir, "custom_components.pt"))
+
+    with open(os.path.join(output_dir, "tied_weights_info.json"), "w") as f:
+        json.dump({"lm_head_tied_to_embeddings": True}, f)
+
+    print(f"Model saved to {output_dir}")
 
 def main():
+    tokenizer = AutoTokenizer.from_pretrained("gpt2", clean_up_tokenization_spaces=True)
+    tokenizer.pad_token = tokenizer.eos_token
     config = EnhancedCustomConfigV2(
-        vocab_size=30522,
-        hidden_size=256,  # Must be divisible by num_attention_heads
-        num_hidden_layers=8,  # Reduced for memory
-        num_attention_heads=8,  # 256 / 8 = 32, which is good
+        vocab_size = tokenizer.vocab_size,
+        hidden_size=512,
+        num_hidden_layers=8,
+        num_attention_heads=8,
         intermediate_size=1024,
         num_tree_layers=2,
         num_thought_steps=2,
@@ -583,30 +752,28 @@ def main():
         use_adapter=True,
         adapter_size=32,
         use_gated_ffn=True,
-        use_moe=True,  # Disabled for initial testing
-        num_experts=4,
-        top_k_experts=4,
+        use_moe=True,
+        num_experts=2,
+        top_k_experts=2,
         use_sparse_attention=True,
         sparse_attention_window=256,
-        use_dynamic_ntk=True,  # Disabled for initial testing
+        use_dynamic_ntk=True,
         ntk_alpha=0.5,
-        use_mixture_of_experts=True,  # Disabled for initial testing
-        num_moe_experts=4,
-        moe_top_k=4
+        use_mixture_of_experts=True,
+        num_moe_experts=2,
+        moe_top_k=2
     )
 
     # Update training configuration
-    config.batch_size = 4
-    config.epochs = 1
-    config.learning_rate = 1e-4  # Reduced learning rate
+    config.batch_size = 3
+    config.epochs = 8
+    config.learning_rate = 3e-5
     config.accumulation_steps = 4
     config.warmup_steps = 100
 
     model = EnhancedCustomModelV2(config)
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased",clean_up_tokenization_spaces=True)
-
     # Start with a very small dataset for testing
-    dataset = WikipediaDataset(tokenizer, max_length=512, subset_size=1000)
+    dataset = WikipediaDataset(tokenizer, max_length=512, subset_size=10000)
 
     try:
         model = train_enhanced_custom_model_v2(model, dataset, config)

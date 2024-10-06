@@ -12,7 +12,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Import the custom classes from the previous implementation
-from new import EnhancedCustomModel, EnhancedCustomConfig, WikipediaDataset
+from enhanced_gpt import EnhancedCustomModelV2, EnhancedCustomConfigV2, WikipediaDataset
 
 def generate_text(model, tokenizer, prompt, max_length=100, temperature=1.0):
     model.eval()
@@ -51,8 +51,8 @@ def calculate_perplexity(model, data_loader, device):
     return perplexity
 
 def load_enhanced_custom_model(model_path):
-    config = EnhancedCustomConfig.from_pretrained(model_path)
-    model = EnhancedCustomModel(config)
+    config = EnhancedCustomConfigV2.from_pretrained(model_path)
+    model = EnhancedCustomModelV2(config)
     
     state_dict = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location=torch.device('cpu'), weights_only=True)
     model.load_state_dict(state_dict, strict=False)

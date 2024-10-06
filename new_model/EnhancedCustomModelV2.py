@@ -1,9 +1,29 @@
-from EnhancedCustomConfigV2 import EnhancedCustomConfigV2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Optional, Union
 from transformers import PreTrainedModel
 from EnhancedLayerV2 import EnhancedLayerV2
-import torch.nn as nn
-import torch
+from EnhancedCustomConfigV2 import EnhancedCustomConfigV2
+from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteriaList, StoppingCriteria
 
+class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
+    def __init__(self, penalty: float):
+        self.penalty = penalty
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        score = torch.gather(scores, 1, input_ids)
+        score = torch.where(score < 0, score * self.penalty, score / self.penalty)
+        scores.scatter_(1, input_ids, score)
+        return scores
+    
+class MaxLengthCriteria(StoppingCriteria):
+    def __init__(self, max_length: int):
+        self.max_length = max_length
+
+    def __call__(self, input_ids: torch.LongTensor, scores: Optional[torch.FloatTensor] = None) -> bool:
+        return input_ids.shape[-1] >= self.max_length
+    
 class EnhancedCustomModelV2(PreTrainedModel):
     config_class = EnhancedCustomConfigV2
     base_model_prefix = "enhanced_custom_v2"
@@ -88,12 +108,8 @@ class EnhancedCustomModelV2(PreTrainedModel):
         embeddings = inputs_embeds + position_embeddings + token_type_embeddings
         hidden_states = self.embedding_dropout(embeddings)
 
-        # Correctly shape the attention_mask for the encoder layers
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-
         for layer in self.encoder:
-            hidden_states = layer(hidden_states, extended_attention_mask)
+            hidden_states = layer(hidden_states, attention_mask)
 
         pooled_output = self.pooler(hidden_states[:, 0])
         
@@ -114,3 +130,91 @@ class EnhancedCustomModelV2(PreTrainedModel):
             'pooled_output': pooled_output,
             'hidden_states': hidden_states,
         }
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_length: int = 50,
+        min_length: int = 10,
+        do_sample: bool = True,
+        num_beams: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        length_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 3,
+        pad_token_id: int = 0,
+        eos_token_id: int = 2,
+        attention_mask: Optional[torch.LongTensor] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+    ) -> List[str]:
+        # Set up logits processors
+        if logits_processor is None:
+            logits_processor = LogitsProcessorList()
+        logits_processor.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+
+        # Set up stopping criteria
+        if stopping_criteria is None:
+            stopping_criteria = StoppingCriteriaList()
+        stopping_criteria.append(MaxLengthCriteria(max_length=max_length))
+
+        # Initialize sequence scores
+        sequence_scores = torch.zeros(input_ids.shape[0], device=input_ids.device)
+
+        # Main generation loop
+        while True:
+            # Forward pass
+            outputs = self(input_ids, attention_mask=attention_mask)
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # Apply logits processors
+            next_token_logits = logits_processor(input_ids, next_token_logits)
+
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
+
+            # Apply top-k filtering
+            if top_k > 0:
+                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+                next_token_logits[next_token_logits < top_k_logits[:, [-1]]] = -float('Inf')
+
+            # Apply top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits[indices_to_remove] = -float('Inf')
+
+            # Sample next token
+            if do_sample:
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1)
+
+            # Update sequence scores
+            next_token_scores = next_token_logits.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
+            sequence_scores += next_token_scores * (length_penalty ** len(input_ids))
+
+            # Append next token to input_ids
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
+
+            # Update attention mask if provided
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1)
+
+            # Check stopping criteria
+            if any(stopping_criteria(input_ids, scores=sequence_scores)):
+                break
+
+        # Decode generated sequences
+        generated_sequences = []
+        for seq in input_ids:
+            generated_sequences.append(self.tokenizer.decode(seq, skip_special_tokens=True))
+
+        return generated_sequences

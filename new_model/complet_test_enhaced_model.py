@@ -2,13 +2,17 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 import numpy as np
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import logging
 import os
 import json
-from typing import Dict, List, Any
+from typing import Dict, List, Tuple, Any
 
 # Import your model classes
-from enhanced_gpt import EnhancedCustomModelV2, EnhancedCustomConfigV2
+from EnhancedCustomModelV2 import EnhancedCustomModelV2
+from EnhancedCustomConfigV2 import EnhancedCustomConfigV2
 
 class ModelTester:
     def __init__(self, model_path: str):
@@ -33,7 +37,7 @@ class ModelTester:
             self.logger.info(f"Loading model from {self.model_path}")
             self.config = EnhancedCustomConfigV2.from_pretrained(self.model_path)
             self.model = EnhancedCustomModelV2.from_pretrained(self.model_path)
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, clean_up_tokenization_spaces=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
             self.model.to(self.device)
             self.model.eval()
             self.logger.info("Model loaded successfully")
@@ -41,27 +45,27 @@ class ModelTester:
             self.logger.error(f"Error loading model: {str(e)}")
             raise
 
-    def generate_text(self, prompt: str, max_length: int = 50, repetition_penalty: float = 1.2) -> str:
+    def generate_text(self, prompt: str, max_length: int = 50) -> str:
         try:
-            # Tokenize input prompt
-            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            generated = inputs.input_ids
             
-            # Generate text
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_length=max_length,
-                    repetition_penalty=repetition_penalty,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.95
-                )
+            for _ in range(max_length):
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    logits = outputs['logits'] if isinstance(outputs, dict) else outputs[0]
+                
+                predictions = logits[:, -1, :]
+                predicted_id = torch.argmax(predictions, dim=-1)
+                
+                if predicted_id.item() == self.tokenizer.eos_token_id:
+                    break
+                
+                generated = torch.cat([generated, predicted_id.unsqueeze(-1)], dim=-1)
+                
+                inputs = self.tokenizer(self.tokenizer.decode(generated[0]), return_tensors="pt").to(self.device)
             
-            # Decode generated text
-            generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
             return generated_text
         except Exception as e:
             self.logger.error(f"Error in text generation: {str(e)}")

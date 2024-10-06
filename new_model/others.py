@@ -19,7 +19,10 @@ def save_enhanced_custom_model_v2(model, tokenizer, output_dir):
     
     torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
 
-    tokenizer.save_pretrained(output_dir)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(output_dir)
+    else:
+        print("Tokenizer not provided. Skipping tokenizer saving.")
 
     custom_components = {
         "tree_layers": [layer.tree.state_dict() for layer in model.encoder],
@@ -52,64 +55,124 @@ def train_enhanced_custom_model_v2(model, dataset, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    train_loader = torch.utils.data.DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    # Create a validation dataset
+    dataset_size = len(dataset)
+    train_size = int(0.9 * dataset_size)
+    val_size = dataset_size - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.learning_rate,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
     
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=config.warmup_steps, num_training_steps=len(train_loader) * config.epochs)
+    num_training_steps = len(train_loader) * config.epochs
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=num_training_steps
+    )
     
     scaler = GradScaler(enabled=(device.type == "cuda"))
+    
+    best_val_loss = float('inf')
+    patience = 3
+    patience_counter = 0
 
     for epoch in range(config.epochs):
         model.train()
         total_loss = 0
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]")
-        optimizer.zero_grad(set_to_none=True)
-
+        
         for i, batch in enumerate(train_pbar):
-            input_ids = batch['input_ids'].squeeze(1).to(device)
-            attention_mask = batch['attention_mask'].squeeze(1).to(device)
-
+            optimizer.zero_grad(set_to_none=True)
+            
             try:
+                input_ids = batch['input_ids'].squeeze(1).to(device)
+                attention_mask = batch['attention_mask'].squeeze(1).to(device)
+                
+                # Create shifted labels for next token prediction
+                labels = input_ids.clone()
+                labels = torch.roll(labels, shifts=-1, dims=1)
+                labels[:, -1] = -100  # Ignore last token prediction
+                
                 with autocast(device_type=device.type, dtype=torch.float16):
-                    outputs = model(input_ids, attention_mask=attention_mask, labels=input_ids)
+                    outputs = model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
                     loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
-                    
-                    if not torch.isfinite(loss):
-                        print(f"Warning: Non-finite loss detected: {loss.item()}. Skipping batch.")
-                        continue
-                    
-                    loss = loss / config.accumulation_steps
-
+                
                 scaler.scale(loss).backward()
+                
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
 
-                if (i + 1) % config.accumulation_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-
-                total_loss += loss.item() * config.accumulation_steps
-                train_pbar.set_postfix({'loss': loss.item() * config.accumulation_steps, 'lr': scheduler.get_last_lr()[0]})
+                total_loss += loss.item()
+                train_pbar.set_postfix({
+                    'loss': loss.item(),
+                    'lr': scheduler.get_last_lr()[0]
+                })
 
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"CUDA out of memory in batch {i}. Skipping batch and clearing cache.")
-                    if hasattr(torch.cuda, 'empty_cache'):
-                        torch.cuda.empty_cache()
-                    continue
-                else:
-                    raise e
+                print(f"Error in batch {i}: {str(e)}")
+                continue
 
-            del input_ids, attention_mask, outputs, loss
-            torch.cuda.empty_cache()
+        avg_train_loss = total_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validating"):
+                input_ids = batch['input_ids'].squeeze(1).to(device)
+                attention_mask = batch['attention_mask'].squeeze(1).to(device)
+                labels = input_ids.clone()
+                labels = torch.roll(labels, shifts=-1, dims=1)
+                labels[:, -1] = -100
+                
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
+                val_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{config.epochs}, Train Loss: {avg_loss:.4f}")
-
-        gc.collect()
-        torch.cuda.empty_cache()
+        avg_val_loss = val_loss / len(val_loader)
+        
+        print(f"Epoch {epoch+1}/{config.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            save_enhanced_custom_model_v2(model, None, f"enhanced_custom_model_v2_best")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
 
     return model

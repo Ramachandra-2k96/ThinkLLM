@@ -1,4 +1,5 @@
 from transformers import PretrainedConfig
+
 class EnhancedCustomConfigV2(PretrainedConfig):
     model_type = "enhanced_custom_v2"
 
