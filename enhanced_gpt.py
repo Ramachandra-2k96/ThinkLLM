@@ -554,6 +554,7 @@ def evaluate_v2(model, eval_loader, device):
     
     return total_loss / len(eval_loader)
 
+
 def train_enhanced_custom_model_v2(model, dataset, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -580,18 +581,25 @@ def train_enhanced_custom_model_v2(model, dataset, config):
         pin_memory=True
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config.learning_rate,
-        weight_decay=0.01,
-        betas=(0.9, 0.999),
-        eps=1e-8
-    )
+    # Initialize optimizer with correct parameters
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": 0.01,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=config.learning_rate)
     
     num_training_steps = len(train_loader) * config.epochs
+    num_warmup_steps = int(num_training_steps * 0.1)  # 10% of total steps for warmup
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=config.warmup_steps,
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
     )
     
@@ -607,43 +615,39 @@ def train_enhanced_custom_model_v2(model, dataset, config):
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]")
         
         for i, batch in enumerate(train_pbar):
-            optimizer.zero_grad(set_to_none=True)
-            
-            try:
-                input_ids = batch['input_ids'].squeeze(1).to(device)
-                attention_mask = batch['attention_mask'].squeeze(1).to(device)
+            optimizer.zero_grad(set_to_none=True)  # Reset gradients
+
+            with autocast(device.type, dtype=torch.float16):
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
                 
                 # Create shifted labels for next token prediction
                 labels = input_ids.clone()
                 labels = torch.roll(labels, shifts=-1, dims=1)
                 labels[:, -1] = -100  # Ignore last token prediction
                 
-                with autocast(device_type=device.type, dtype=torch.float16):
-                    outputs = model(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
-                    loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
-                
-                scaler.scale(loss).backward()
-                
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-
-                total_loss += loss.item()
-                train_pbar.set_postfix({
-                    'loss': loss.item(),
-                    'lr': scheduler.get_last_lr()[0]
-                })
-
-            except RuntimeError as e:
-                print(f"Error in batch {i}: {str(e)}")
-                continue
+                outputs = model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
+            
+            scaler.scale(loss).backward()
+            
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            total_loss += loss.item()
+            
+            train_pbar.set_postfix({
+                'loss': total_loss / (i + 1),
+                'lr': scheduler.get_last_lr()[0]
+            })
 
         avg_train_loss = total_loss / len(train_loader)
         
@@ -652,8 +656,8 @@ def train_enhanced_custom_model_v2(model, dataset, config):
         val_loss = 0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating"):
-                input_ids = batch['input_ids'].squeeze(1).to(device)
-                attention_mask = batch['attention_mask'].squeeze(1).to(device)
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
                 labels = input_ids.clone()
                 labels = torch.roll(labels, shifts=-1, dims=1)
                 labels[:, -1] = -100
@@ -670,7 +674,6 @@ def train_enhanced_custom_model_v2(model, dataset, config):
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            # Save best model
             save_enhanced_custom_model_v2(model, None, f"enhanced_custom_model_v2_best")
         else:
             patience_counter += 1
@@ -680,29 +683,48 @@ def train_enhanced_custom_model_v2(model, dataset, config):
 
     return model
 
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import List, Dict
+
 class WikipediaDataset(Dataset):
-    def __init__(self, tokenizer, max_length=128, subset_size=None):
+    def __init__(self, tokenizer, chunk_size=512, chunk_overlap=24, subset_size=None):
         self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
         
+        # Initialize text splitter
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        
+        # Load dataset
         dataset = load_dataset("wikipedia", "20220301.en", split="train")
         if subset_size is not None:
             dataset = dataset.select(range(min(subset_size, len(dataset))))
         
-        self.data = dataset["text"]
+        # Split all texts and flatten the list
+        self.chunks: List[str] = []
+        for text in dataset["text"]:
+            text_chunks = self.text_splitter.split_text(text)
+            self.chunks.extend(text_chunks)
         
     def __len__(self):
-        return len(self.data)
+        return len(self.chunks)
     
-    def __getitem__(self, idx):
-        # GPT-2 tokenization process
-        return self.tokenizer(
-            self.data[idx],
-            max_length=self.max_length,
+    def __getitem__(self, idx) -> Dict:
+        # Tokenize the chunk
+        encodings = self.tokenizer(
+            self.chunks[idx],
             truncation=True,
-            padding='max_length',  
+            padding='max_length',
+            max_length=self.chunk_size,
             return_tensors="pt"
         )
+        return {key: value.squeeze(0) for key, value in encodings.items()}
  
 def save_enhanced_custom_model_v2(model, tokenizer, output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -738,42 +760,42 @@ def save_enhanced_custom_model_v2(model, tokenizer, output_dir):
 def main():
     tokenizer = AutoTokenizer.from_pretrained("gpt2", clean_up_tokenization_spaces=True)
     tokenizer.pad_token = tokenizer.eos_token
+    
     config = EnhancedCustomConfigV2(
-        vocab_size = tokenizer.vocab_size,
-        hidden_size=512,
-        num_hidden_layers=8,
-        num_attention_heads=8,
-        intermediate_size=1024,
-        num_tree_layers=2,
-        num_thought_steps=2,
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=512,  # Increased from 512
+        num_hidden_layers=8,  # Increased from 8
+        num_attention_heads=8,  # Increased from 8
+        intermediate_size=1024,  # Increased from 1024
+        num_tree_layers=3,  # Increased from 2
+        num_thought_steps=3,  # Increased from 2
         max_position_embeddings=512,
         tie_word_embeddings=True,
         use_rezero=True,
         use_adapter=True,
-        adapter_size=32,
+        adapter_size=64,  # Increased from 32
         use_gated_ffn=True,
         use_moe=True,
-        num_experts=2,
+        num_experts=4,  # Increased from 2
         top_k_experts=2,
         use_sparse_attention=True,
         sparse_attention_window=256,
         use_dynamic_ntk=True,
         ntk_alpha=0.5,
         use_mixture_of_experts=True,
-        num_moe_experts=2,
+        num_moe_experts=4,  # Increased from 2
         moe_top_k=2
     )
 
     # Update training configuration
-    config.batch_size = 3
-    config.epochs = 8
-    config.learning_rate = 3e-5
-    config.accumulation_steps = 4
-    config.warmup_steps = 100
+    config.batch_size = 2 # Slightly increased
+    config.epochs = 2  # Increased from 1
+    config.learning_rate = 5e-5  # Slightly increased
+    config.accumulation_steps = 8
+    config.warmup_steps = 200  # Increased from 100
 
     model = EnhancedCustomModelV2(config)
-    # Start with a very small dataset for testing
-    dataset = WikipediaDataset(tokenizer, max_length=512, subset_size=10000)
+    dataset = WikipediaDataset(tokenizer, chunk_size=512, chunk_overlap=12, subset_size=2000)  # Increased dataset size
 
     try:
         model = train_enhanced_custom_model_v2(model, dataset, config)

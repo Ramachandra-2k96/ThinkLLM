@@ -41,7 +41,7 @@ class ModelTester:
             self.logger.error(f"Error loading model: {str(e)}")
             raise
 
-    def generate_text(self, prompt: str, max_length: int = 50, repetition_penalty: float = 1.2) -> str:
+    def generate_text(self, prompt: str, max_length: int = 500, repetition_penalty: float = 1.6) -> str:
         try:
             # Tokenize input prompt
             inputs = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
@@ -57,7 +57,8 @@ class ModelTester:
                     eos_token_id=self.tokenizer.eos_token_id,
                     do_sample=True,
                     temperature=0.7,
-                    top_p=0.95
+                    top_p=0.3,
+                    top_k = 50,
                 )
             
             # Decode generated text
@@ -96,13 +97,13 @@ class ModelTester:
 def main():
     # Test texts
     test_texts = [
-        "The quick brown fox jumps over the lazy dog.",
-        "In a world of artificial intelligence, machine learning models continue to evolve.",
-        "Climate change poses significant challenges to our planet's ecosystems."
+        "The quick",
+        "In a world of artificial intelligence, machine",
+        "Climate change poses significant challenges to"
     ]
     
     # Initialize and run tests
-    model_path = "enhanced_custom_model_v2_final"  # Update this to your model path
+    model_path = "enhanced_custom_model_v2_final" 
     tester = ModelTester(model_path)
     
     results = tester.run_all_tests(test_texts)
