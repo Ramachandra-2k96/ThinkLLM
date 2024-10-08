@@ -591,4 +591,4 @@ def main(num_examples=None):
     print("\nTraining completed. Starting chat interface...")
 
 if __name__ == "__main__":
-    main(num_examples=100)  # Set to None to use the entire dataset
+    main(num_examples=1000)  # Set to None to use the entire dataset

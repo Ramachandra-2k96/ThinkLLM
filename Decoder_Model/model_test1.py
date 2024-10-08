@@ -1,7 +1,7 @@
 import torch
 from transformers import GPT2Tokenizer
 
-from Encoder_Model.chatmodel import DecoderOnlyGPT
+from Decoder_Model.chatmodel import DecoderOnlyGPT
 # Load the trained model and tokenizer
 model_path = "enhanced_wikipedia_chatbot_tokenizer"  # Update this to your model path
 tokenizer_path = "enhanced_wikipedia_chatbot_tokenizer"  # Update this to your tokenizer path

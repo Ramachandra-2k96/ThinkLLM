@@ -62,3 +62,5 @@ new_model/enhanced_custom_model_v2_final
 test_results/
 enhanced_custom_model_v2_best/
 enhanced_custom_model_v2_final/
+Decoder_Model/checkpoint*
+Decoder_Model/enhanced_wikipedia_chatbot_model
