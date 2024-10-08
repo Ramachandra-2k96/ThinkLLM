@@ -1,105 +1,126 @@
 import torch
+import argparse
 from transformers import GPT2Tokenizer
-import logging
-logging.basicConfig(level=logging.INFO)
+from chatmodel import DecoderOnlyGPT, DecoderOnlyConfig
+import os
 
-def load_model_and_tokenizer(model_path, tokenizer_path):
-    try:
-        # Load tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_path)
-        tokenizer.pad_token = tokenizer.eos_token
-        logging.info("Tokenizer loaded successfully")
-
-        # Load model
-        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
-        
-        # Verify checkpoint contents
-        if 'model_state_dict' not in checkpoint or 'config' not in checkpoint:
-            raise ValueError("Checkpoint is missing required components")
-        
-        config = checkpoint['config']
-        
-        # Import your model class
-        from chatmodel import DecoderOnlyGPT
-        
-        # Initialize model with config
-        model = DecoderOnlyGPT(config)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        logging.info("Model loaded successfully")
-        
-        return model, tokenizer
-    except Exception as e:
-        logging.error(f"Error loading model or tokenizer: {str(e)}")
-        raise
-
-def generate_text(model, tokenizer, prompt, max_length=50):
-    try:
-        # Prepare input
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-        
-        # Generate
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs['logits']
-            
-        # Get next token predictions
-        next_token_logits = logits[0, -1, :]
-        next_token = torch.argmax(next_token_logits).item()
-        
-        # Decode
-        generated_text = tokenizer.decode(inputs['input_ids'][0]) + tokenizer.decode([next_token])
-        return generated_text
-    except Exception as e:
-        logging.error(f"Error during text generation: {str(e)}")
-        return None
-
-def test_model():
-    MODEL_PATH = "enhanced_wikipedia_chatbot_model.pt"
-    TOKENIZER_PATH = "enhanced_wikipedia_chatbot_tokenizer"
+def load_model_for_inference(model_path):
+    """
+    Load the saved model for inference, including all enhanced components.
+    """
+    # Load config and create model
+    config = DecoderOnlyConfig.from_pretrained(model_path)
+    model = DecoderOnlyGPT(config)
     
-    try:
-        # Load model and tokenizer
-        model, tokenizer = load_model_and_tokenizer(MODEL_PATH, TOKENIZER_PATH)
+    # Load tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(model_path,)
+    
+    # Load the full state dictionary
+    full_state_path = os.path.join(model_path, 'training_state.bin')
+    if os.path.exists(full_state_path):
+        full_state = torch.load(full_state_path, map_location=torch.device('cpu'))
         
-        # Test prompts
-        test_prompts = [
-            "The capital of France is",
-            "Artificial Intelligence is",
-            "The purpose of education is"
-        ]
+        # Load the main model weights
+        model.load_state_dict(torch.load(os.path.join(model_path, 'pytorch_model.bin'), map_location=torch.device('cpu')))
         
-        # Generate and print responses
-        for prompt in test_prompts:
-            logging.info(f"\nPrompt: {prompt}")
-            response = generate_text(model, tokenizer, prompt)
-            if response:
-                logging.info(f"Generated: {response}")
-            else:
-                logging.warning(f"Failed to generate response for: {prompt}")
-                
-        # Test memory states
-        logging.info("\nTesting memory states...")
-        outputs = model(
-            **tokenizer("This is a test of memory states.", return_tensors="pt"),
-            output_hidden_states=True
+        # Load additional components
+        additional_components = full_state.get('additional_components', {})
+        
+        for i, block in enumerate(model.h):
+            if hasattr(block.mlp, 'experts') and 'moe_states' in additional_components:
+                block.mlp.load_state_dict(additional_components['moe_states'][i])
+            if hasattr(block, 'ntk') and 'ntk_states' in additional_components:
+                block.ntk.load_state_dict(additional_components['ntk_states'][i])
+            if hasattr(block, 'decision_trees') and 'decision_tree_states' in additional_components:
+                block.decision_trees.load_state_dict(additional_components['decision_tree_states'][i])
+            if hasattr(block, 'cognitive') and 'cognitive_states' in additional_components:
+                block.cognitive.load_state_dict(additional_components['cognitive_states'][i])
+        
+        # Load memory states if they exist
+        if 'memory_states' in full_state.get('training_state', {}):
+            for i, block in enumerate(model.h):
+                if hasattr(block, 'cognitive'):
+                    block.cognitive.memory_state = full_state['training_state']['memory_states'][i]
+    else:
+        print(f"Warning: Full state file not found at {full_state_path}. Loading only the base model.")
+        model = DecoderOnlyGPT.from_pretrained(model_path, config=config)
+    
+    return model, tokenizer
+def generate_response(model, tokenizer, input_text, max_length=100):
+    """
+    Generate a response from the model given an input text.
+    """
+    input_ids = tokenizer.encode(input_text, return_tensors="pt")
+    
+    # Move input to the same device as the model
+    input_ids = input_ids.to(model.device)
+    
+    # Set the pad token ID to the EOS token ID if not set
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Generate output
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            max_length=max_length,
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.7,
+            pad_token_id=tokenizer.pad_token_id,
         )
-        if 'memory_states' in outputs:
-            logging.info("Memory states successfully generated")
-            
-        # Test model components
-        logging.info("\nVerifying model components...")
-        expected_attributes = ['cognitive', 'ntk', 'decision_trees']
-        for block in model.h:
-            for attr in expected_attributes:
-                if hasattr(block, attr):
-                    logging.info(f"{attr} component found in model block")
-                else:
-                    logging.warning(f"{attr} component not found in model block")
     
-    except Exception as e:
-        logging.error(f"Test failed: {str(e)}")
+    # Decode the output
+    response = tokenizer.decode(output[0], skip_special_tokens=True)
+    
+    return response
+
+def chat_loop(model, tokenizer):
+    """
+    Run an interactive chat loop with the model.
+    """
+    print("Welcome to the Enhanced Wikipedia Chatbot!")
+    print("Type 'quit' or 'exit' to end the conversation.")
+    
+    context = ""
+    while True:
+        user_input = input("\nYou: ")
+        if user_input.lower() in ['quit', 'exit']:
+            print("Goodbye!")
+            break
+        
+        # Append user input to context
+        context += f"Human: {user_input}\nAI: "
+        
+        # Generate response
+        response = generate_response(model, tokenizer, context)
+        
+        # Extract the AI's response
+        ai_response = response.split("AI: ")[-1].strip()
+        
+        print(f"AI: {ai_response}")
+        
+        # Update context
+        context += f"{ai_response}\n"
+
+def main():
+    model_path = "final_enhanced_wikipedia_chatbot"
+    # Load model and tokenizer
+    print(f"Loading model from {model_path}")
+    model, tokenizer = load_model_for_inference(model_path)
+
+    # Move model to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()  # Set the model to evaluation mode
+
+    print(f"Model loaded successfully. Using device: {device}")
+
+    # Start chat loop
+    chat_loop(model, tokenizer)
 
 if __name__ == "__main__":
-    logging.info("Starting model test...")
-    test_model()
+    main()

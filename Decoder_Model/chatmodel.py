@@ -15,6 +15,7 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from datasets import load_dataset
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import os
 
 class CognitiveLayer(nn.Module):
     def __init__(self, config):
@@ -413,32 +414,301 @@ class DecoderOnlyGPT(PreTrainedModel):
             "hidden_states": hidden_states,
             "memory_states": memory_states,
         }
+    def generate(
+        self,
+        input_ids,
+        max_length=50,
+        min_length=10,
+        do_sample=True,
+        temperature=1.0,
+        top_k=50,
+        top_p=0.95,
+        repetition_penalty=1.2,
+        pad_token_id=None,
+        eos_token_id=None,
+        attention_mask=None,
+        num_return_sequences=1,
+        no_repeat_ngram_size=None
+    ):
+        # Set the model to evaluation mode
+        self.eval()
+        
+        # Move input_ids to the same device as the model
+        device = next(self.parameters()).device
+        input_ids = input_ids.to(device)
+        
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
-# Update the save and load functionality
-def save_enhanced_model(model, path):
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': model.config,
-    }, path)
+        # Repeat input IDs for num_return_sequences
+        batch_size = input_ids.size(0)
+        input_ids = input_ids.repeat_interleave(num_return_sequences, dim=0)
+        
+        if attention_mask is not None:
+            attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
 
-def load_enhanced_model(path):
-    checkpoint = torch.load(path)
-    config = checkpoint['config']
-    model = DecoderOnlyGPT(config)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    return model
+        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=device)
+        
+        # To track generated n-grams if no_repeat_ngram_size is set
+        generated_ngrams = [{} for _ in range(input_ids.size(0))] if no_repeat_ngram_size else None
+        
+        with torch.no_grad():
+            while input_ids.shape[-1] < max_length:
+                # Forward pass
+                outputs = self(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                
+                next_token_logits = outputs["logits"][:, -1, :] / temperature
+                
+                # Apply repetition penalty
+                if repetition_penalty != 1.0:
+                    for i in range(input_ids.shape[0]):
+                        for previous_token in set(input_ids[i].tolist()):
+                            next_token_logits[i, previous_token] /= repetition_penalty
+                
+                # Filter using top-k and top-p
+                if do_sample:
+                    # Top-k filtering
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+                    
+                    # Top-p filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                        next_token_logits[indices_to_remove] = float('-inf')
+                    
+                    # Sample from filtered distribution
+                    probs = torch.softmax(next_token_logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                
+                # Check n-gram repetition
+                if no_repeat_ngram_size:
+                    for i, (tokens, ngrams) in enumerate(zip(input_ids, generated_ngrams)):
+                        generated_ngrams[i] = self.update_ngram_constraints(
+                            ngrams, tokens, next_tokens[i], no_repeat_ngram_size
+                        )
+                
+                # Update input_ids and attention_mask
+                input_ids = torch.cat([input_ids, next_tokens], dim=-1)
+                if attention_mask is not None:
+                    attention_mask = torch.cat([
+                        attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], 1))
+                    ], dim=-1)
+                
+                # Check if sequences are finished
+                if eos_token_id is not None:
+                    unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+                
+                # Stop if all sequences are finished or max_length is reached
+                if unfinished_sequences.max() == 0 or input_ids.shape[-1] >= max_length:
+                    break
+        
+        # Reshape output if num_return_sequences > 1
+        if num_return_sequences > 1:
+            return input_ids.view(batch_size, num_return_sequences, -1)
+        
+        return input_ids
 
-# Update the training function
-def train_chatbot_model(model, dataset, config):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def update_ngram_constraints(self, ngrams, input_seq, next_token, n):
+        """Helper function to update n-gram tracking for no_repeat_ngram_size."""
+        if len(input_seq) >= n - 1:
+            gram = tuple(input_seq[-(n-1):].tolist())
+            if gram in ngrams and next_token.item() in ngrams[gram]:
+                # Find the next best token that doesn't create a repeated n-gram
+                logits = self(input_ids=input_seq.unsqueeze(0))["logits"][0, -1]
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                for new_token in sorted_indices:
+                    if gram not in ngrams or new_token.item() not in ngrams[gram]:
+                        next_token.fill_(new_token.item())
+                        break
+            ngrams.setdefault(gram, set()).add(next_token.item())
+        return ngrams
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+import os
+import torch
+from transformers import PreTrainedModel
+
+def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, train_loss_history, scaler, path):
+    """
+    Save the enhanced model and all training state in HuggingFace format with improved error handling.
     
+    Args:
+        model: The DecoderOnlyGPT model
+        optimizer: The optimizer used for training
+        scheduler: The learning rate scheduler
+        tokenizer: The tokenizer used with the model
+        config: The model configuration
+        epoch: Current training epoch
+        train_loss_history: List of training losses
+        scaler: The GradScaler used for mixed precision training
+        path: Directory path to save the model and associated files
+    """
     try:
-        model = model.to(device)
-    except RuntimeError:
-        print("Not enough GPU memory. Falling back to CPU.")
-        device = torch.device("cpu")
-        model = model.to(device)
+        # Create directory if it doesn't exist
+        os.makedirs(path, exist_ok=True)
+        
+        # 1. Save the model state
+        model_to_save = model.module if hasattr(model, 'module') else model
+        if isinstance(model_to_save, PreTrainedModel):
+            model_to_save.save_pretrained(path, safe_serialization=False)
+        else:
+            torch.save(model_to_save.state_dict(), os.path.join(path, 'pytorch_model.bin'))
+        
+        # 2. Save the tokenizer
+        if tokenizer is not None:
+            tokenizer.save_pretrained(path)
+        
+        # 3. Save the config
+        if config is not None:
+            config.save_pretrained(path)
+        
+        # 4. Save the training state
+        training_state = {
+            'epoch': epoch,
+            'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'train_loss_history': train_loss_history,
+            'scaler': scaler.state_dict() if scaler else None,
+        }
+        
+        # 5. Save additional components
+        additional_components = {}
+        for i, block in enumerate(model.h):
+            if hasattr(block, 'mlp') and hasattr(block.mlp, 'experts'):
+                additional_components.setdefault('moe_states', {})[i] = block.mlp.state_dict()
+            if hasattr(block, 'ntk'):
+                additional_components.setdefault('ntk_states', {})[i] = block.ntk.state_dict()
+            if hasattr(block, 'decision_trees'):
+                additional_components.setdefault('decision_tree_states', {})[i] = block.decision_trees.state_dict()
+            if hasattr(block, 'cognitive'):
+                additional_components.setdefault('cognitive_states', {})[i] = block.cognitive.state_dict()
+        
+        # Combine all states
+        full_state = {
+            'training_state': training_state,
+            'additional_components': additional_components
+        }
+        
+        # Save the combined state
+        torch.save(full_state, os.path.join(path, 'training_state.bin'))
+        
+        print(f"Model and training state successfully saved to {path}")
+    except Exception as e:
+        print(f"Error occurred while saving the model: {str(e)}")
+        raise
 
+def load_enhanced_model(path, training=False):
+    """
+    Load the enhanced model and optionally training state.
+    
+    Args:
+        path: Path to the saved model directory
+        training: Whether to load training state (optimizer, scheduler, etc.)
+    
+    Returns:
+        If training=False: model, tokenizer
+        If training=True: model, tokenizer, optimizer, scheduler, start_epoch, train_loss_history, scaler
+    """
+    import os
+    from transformers import GPT2Tokenizer
+    
+    # 1. Load config and model
+    config = DecoderOnlyConfig.from_pretrained(path)
+    model = DecoderOnlyGPT.from_pretrained(path, config=config)
+    
+    # 2. Load tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(path)
+    
+    if not training:
+        return model, tokenizer
+    
+    # 3. Load training state
+    training_state_path = os.path.join(path, 'training_state.bin')
+    if not os.path.exists(training_state_path):
+        raise FileNotFoundError(f"Training state not found at {training_state_path}")
+    
+    full_state = torch.load(training_state_path)
+    training_state = full_state['training_state']
+    additional_components = full_state['additional_components']
+    
+    # 4. Restore additional components
+    for i, block in enumerate(model.h):
+        if hasattr(block.mlp, 'experts'):
+            block.mlp.load_state_dict(additional_components['moe_states'][i])
+        if hasattr(block, 'ntk'):
+            block.ntk.load_state_dict(additional_components['ntk_states'][i])
+        if hasattr(block, 'decision_trees'):
+            block.decision_trees.load_state_dict(additional_components['decision_tree_states'][i])
+        if hasattr(block, 'cognitive'):
+            block.cognitive.load_state_dict(additional_components['cognitive_states'][i])
+    
+    # 5. Create and load optimizer
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer.load_state_dict(training_state['optimizer_state_dict'])
+    
+    # 6. Create and load scheduler if it exists
+    scheduler = None
+    if training_state['scheduler_state_dict'] is not None:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=config.num_training_steps
+        )
+        scheduler.load_state_dict(training_state['scheduler_state_dict'])
+    
+    # 7. Restore memory states if they exist
+    if 'memory_states' in training_state:
+        for i, block in enumerate(model.h):
+            if hasattr(block, 'cognitive'):
+                block.cognitive.memory_state = training_state['memory_states'][i]
+    
+    # 8. Create and load GradScaler
+    scaler = torch.amp.GradScaler()
+    scaler.load_state_dict(training_state['scaler'])
+    
+    return model, tokenizer, optimizer, scheduler, training_state['epoch'], training_state['train_loss_history'], scaler
+
+
+def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_loss_history=None):
+    """
+    Train the chatbot model with mixed precision and enhanced save functionality.
+    
+    Args:
+        model: The DecoderOnlyGPT model
+        tokenizer: The tokenizer used with the model
+        dataset: The dataset to train on
+        config: Training configuration
+        start_epoch: Epoch to start training from (default: 0)
+        train_loss_history: Previous training loss history (default: None)
+    
+    Returns:
+        tuple: (trained model, training loss history)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    # Initialize mixed precision training
+    scaler = torch.amp.GradScaler()
+    
     train_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
     
@@ -448,49 +718,65 @@ def train_chatbot_model(model, dataset, config):
         num_warmup_steps=config.warmup_steps,
         num_training_steps=num_training_steps
     )
+    
+    if train_loss_history is None:
+        train_loss_history = []
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         model.train()
         total_loss = 0
-        memory_states = [None] * len(model.h)
-        
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        
         for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
-            outputs = model(
-                input_ids, 
-                attention_mask=attention_mask, 
-                labels=labels
-            )
-            loss = outputs['loss']
-            memory_states = outputs.get('memory_states', [None] * len(model.h))
+            # Automatic mixed precision context
+            with torch.amp.autocast('cuda'):
+                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss']
             
-            loss.backward()
+            # Scale the loss and call backward
+            scaler.scale(loss).backward()
+            
+            # Unscale before gradient clipping
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            
+            # Step optimizer and update scaler
+            scaler.step(optimizer)
+            scaler.update()
+            
             scheduler.step()
             optimizer.zero_grad()
             
             total_loss += loss.item()
             
-            current_lr = scheduler.get_last_lr()[0]
             progress_bar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'avg_loss': f"{total_loss / (progress_bar.n + 1):.4f}",
-                'lr': f"{current_lr:.2e}"
+                'lr': f"{scheduler.get_last_lr()[0]:.2e}"
             })
         
         avg_loss = total_loss / len(train_loader)
+        train_loss_history.append(avg_loss)
         print(f"Epoch {epoch+1}/{config.num_epochs}, Average Loss: {avg_loss:.4f}")
         
         # Save checkpoint after each epoch
-        save_enhanced_model(model, f"checkpoint_epoch_{epoch+1}.pt")
+        save_enhanced_model(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            tokenizer=tokenizer,
+            config=config,
+            epoch=epoch+1,
+            train_loss_history=train_loss_history,
+            scaler=scaler,  # Add scaler to saved state
+            path=f"checkpoint_epoch_{epoch+1}"
+        )
     
-    return model
-
+    return model, train_loss_history, scaler, scheduler, optimizer
 
 class WikipediaDataset(Dataset):
     def __init__(self, tokenizer, max_length=512, num_examples=None):
@@ -498,7 +784,7 @@ class WikipediaDataset(Dataset):
         self.max_length = max_length
         
         # Load Wikipedia dataset
-        dataset = load_dataset("wikipedia", "20220301.en", split="train[:1%]")
+        dataset = load_dataset("wikipedia", "20220301.en", split="train[:2%]")
         
         # Use RecursiveCharacterTextSplitter from LangChain
         text_splitter = RecursiveCharacterTextSplitter(
@@ -536,59 +822,109 @@ class WikipediaDataset(Dataset):
             'labels': labels.squeeze(0)
         }
 
-def main(num_examples=None):
+def main(num_examples=None, resume_from=None):
+    # Training configuration
+    training_config = {
+        'batch_size': 2,
+        'num_epochs': 3,
+        'learning_rate': 5e-5,
+        'warmup_steps': 100,
+        'max_length': 512,
+    }
+
     # Initialize tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2",clean_up_tokenization_spaces=True)
     tokenizer.pad_token = tokenizer.eos_token
-    
-    # Initialize enhanced model configuration
-    config = DecoderOnlyConfig(
-        vocab_size=tokenizer.vocab_size,
-        n_positions=512,
-        n_embd=768,
-        n_layer=4,       # Reduced from 8
-        n_head=8,
-        n_inner=3072,
-        activation_function="gelu_new",
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        use_cache=True,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        use_moe=True,
-        num_experts=2,   # Reduced from 4
-        top_k_experts=2,
-        use_cognitive_layer=True,
-        use_ntk_layer=True,
-        use_decision_trees=True
-    )
-    
-    # Create enhanced model
-    model = DecoderOnlyGPT(config)
-    
+
+    # Initialize or load model and training state
+    if resume_from:
+        print(f"Resuming training from {resume_from}")
+        model, tokenizer, optimizer, scheduler, start_epoch, train_loss_history = load_enhanced_model(
+            resume_from, training=True
+        )
+    else:
+        print("Initializing new model")
+        config = DecoderOnlyConfig(
+            vocab_size=tokenizer.vocab_size,
+            n_positions=training_config['max_length'],
+            n_embd=512,
+            n_layer=8,
+            n_head=8,
+            n_inner=1536,
+            learning_rate=training_config['learning_rate'],
+            num_epochs=training_config['num_epochs'],
+            batch_size=training_config['batch_size'],
+            warmup_steps=training_config['warmup_steps'],
+            use_moe=True,
+            num_experts=2,
+            top_k_experts=2,
+            use_cognitive_layer=True,
+            use_ntk_layer=True,
+            use_decision_trees=True
+        )
+        model = DecoderOnlyGPT(config)
+        start_epoch = 0
+        train_loss_history = None
+
     # Create dataset
-    dataset = WikipediaDataset(tokenizer, num_examples=num_examples)
-    
-    # Training configuration
-    train_config = type('TrainConfig', (), {
-        'batch_size': 1,
-        'learning_rate': 5e-5,
-        'num_epochs': 3,
-        'warmup_steps': 100
-    })()
-    
+    print(f"Creating dataset with {'all examples' if num_examples is None else f'{num_examples} examples'}")
+    dataset = WikipediaDataset(
+        tokenizer, 
+        max_length=training_config['max_length'],
+        num_examples=num_examples
+    )
+
+    # Update config with correct number of training steps
+    num_training_steps = len(dataset) // training_config['batch_size'] * training_config['num_epochs']
+    model.config.num_training_steps = num_training_steps
+
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Move model to device
+    model = model.to(device)
+
     # Train the model
-    print("Training enhanced model...")
-    trained_model = train_chatbot_model(model, dataset, train_config)
-    
+    print("Starting training...")
+    trained_model, final_loss_history, scaler, scheduler, optimizer = train_chatbot_model(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        config=model.config,
+        start_epoch=start_epoch,
+        train_loss_history=train_loss_history
+    )
+
     # Save the final trained model
-    save_enhanced_model(trained_model, "enhanced_wikipedia_chatbot_model.pt")
-    tokenizer.save_pretrained("enhanced_wikipedia_chatbot_tokenizer")
-    
-    print("\nTraining completed. Starting chat interface...")
+    final_save_path = "final_enhanced_wikipedia_chatbot"
+    print(f"Saving final model to {final_save_path}")
+    save_enhanced_model(
+        model=trained_model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        tokenizer=tokenizer,
+        config=model.config,
+        epoch=model.config.num_epochs,
+        train_loss_history=final_loss_history,
+        scaler=scaler,
+        path=final_save_path
+    )
+
+    print(f"\nTraining completed. Final model saved to {final_save_path}")
+
+    return trained_model, tokenizer, final_loss_history
 
 if __name__ == "__main__":
-    main(num_examples=1000)  # Set to None to use the entire dataset
+    import argparse
+    parser = argparse.ArgumentParser(description='Train enhanced chatbot model')
+    parser.add_argument('--num_examples', type=int, default=None, 
+                        help='Number of examples to use for training (default: all)')
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Path to checkpoint to resume training from')
+    args = parser.parse_args()
+
+    trained_model, tokenizer, loss_history = main(
+        num_examples=args.num_examples,
+        resume_from=args.resume_from
+    )
