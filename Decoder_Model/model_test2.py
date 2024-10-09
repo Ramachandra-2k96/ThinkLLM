@@ -1,126 +1,94 @@
 import torch
-import argparse
 from transformers import GPT2Tokenizer
-from chatmodel import DecoderOnlyGPT, DecoderOnlyConfig
-import os
+from typing import List
 
-def load_model_for_inference(model_path):
-    """
-    Load the saved model for inference, including all enhanced components.
-    """
-    # Load config and create model
-    config = DecoderOnlyConfig.from_pretrained(model_path)
-    model = DecoderOnlyGPT(config)
-    
-    # Load tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained(model_path,)
-    
-    # Load the full state dictionary
-    full_state_path = os.path.join(model_path, 'training_state.bin')
-    if os.path.exists(full_state_path):
-        full_state = torch.load(full_state_path, map_location=torch.device('cpu'))
-        
-        # Load the main model weights
-        model.load_state_dict(torch.load(os.path.join(model_path, 'pytorch_model.bin'), map_location=torch.device('cpu')))
-        
-        # Load additional components
-        additional_components = full_state.get('additional_components', {})
-        
-        for i, block in enumerate(model.h):
-            if hasattr(block.mlp, 'experts') and 'moe_states' in additional_components:
-                block.mlp.load_state_dict(additional_components['moe_states'][i])
-            if hasattr(block, 'ntk') and 'ntk_states' in additional_components:
-                block.ntk.load_state_dict(additional_components['ntk_states'][i])
-            if hasattr(block, 'decision_trees') and 'decision_tree_states' in additional_components:
-                block.decision_trees.load_state_dict(additional_components['decision_tree_states'][i])
-            if hasattr(block, 'cognitive') and 'cognitive_states' in additional_components:
-                block.cognitive.load_state_dict(additional_components['cognitive_states'][i])
-        
-        # Load memory states if they exist
-        if 'memory_states' in full_state.get('training_state', {}):
-            for i, block in enumerate(model.h):
-                if hasattr(block, 'cognitive'):
-                    block.cognitive.memory_state = full_state['training_state']['memory_states'][i]
-    else:
-        print(f"Warning: Full state file not found at {full_state_path}. Loading only the base model.")
-        model = DecoderOnlyGPT.from_pretrained(model_path, config=config)
-    
-    return model, tokenizer
-def generate_response(model, tokenizer, input_text, max_length=100):
-    """
-    Generate a response from the model given an input text.
-    """
-    input_ids = tokenizer.encode(input_text, return_tensors="pt")
-    
-    # Move input to the same device as the model
-    input_ids = input_ids.to(model.device)
-    
-    # Set the pad token ID to the EOS token ID if not set
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    # Generate output
-    with torch.no_grad():
-        output = model.generate(
-            input_ids,
-            max_length=max_length,
-            num_return_sequences=1,
-            no_repeat_ngram_size=2,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.7,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-    
-    # Decode the output
-    response = tokenizer.decode(output[0], skip_special_tokens=True)
-    
-    return response
+# Import the necessary classes and functions
+from chatmodel import DecoderOnlyGPT, DecoderOnlyConfig, load_enhanced_model
 
-def chat_loop(model, tokenizer):
+def load_model_for_chat(model_path: str):
     """
-    Run an interactive chat loop with the model.
+    Load the saved model and prepare it for conversation.
     """
-    print("Welcome to the Enhanced Wikipedia Chatbot!")
-    print("Type 'quit' or 'exit' to end the conversation.")
+    # Load the model, tokenizer, and other components
+    model, tokenizer = load_enhanced_model(model_path, training=False)
     
-    context = ""
-    while True:
-        user_input = input("\nYou: ")
-        if user_input.lower() in ['quit', 'exit']:
-            print("Goodbye!")
-            break
-        
-        # Append user input to context
-        context += f"Human: {user_input}\nAI: "
-        
-        # Generate response
-        response = generate_response(model, tokenizer, context)
-        
-        # Extract the AI's response
-        ai_response = response.split("AI: ")[-1].strip()
-        
-        print(f"AI: {ai_response}")
-        
-        # Update context
-        context += f"{ai_response}\n"
-
-def main():
-    model_path = "final_enhanced_wikipedia_chatbot"
-    # Load model and tokenizer
-    print(f"Loading model from {model_path}")
-    model, tokenizer = load_model_for_inference(model_path)
-
     # Move model to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()  # Set the model to evaluation mode
+    
+    return model, tokenizer, device
 
-    print(f"Model loaded successfully. Using device: {device}")
+def generate_response(model: DecoderOnlyGPT, tokenizer: GPT2Tokenizer, 
+                      input_text: str, device: torch.device, 
+                      max_length: int = 100) -> str:
+    """
+    Generate a response using the loaded model.
+    """
+    # Tokenize the input text
+    input_ids = tokenizer.encode(input_text, return_tensors='pt').to(device)
+    
+    # Generate output
+    with torch.no_grad():
+        generated_ids_beam = model.generate(
+            input_ids,
+            num_beams=4,
+            num_beam_groups=2,
+            diversity_penalty=1.0,
+            length_penalty=1.0,
+            decoder_strategy="beam_search",
+            cognitive_memory_influence=0.3,
+            expert_confidence_threshold=0.7,
+            max_length=200
+        )
 
-    # Start chat loop
-    chat_loop(model, tokenizer)
+        # Greedy
+        generated_ids_greedy = model.generate(
+            input_ids,
+            decoder_strategy="greedy",
+            cognitive_memory_influence=0.3,
+            expert_confidence_threshold=0.7,
+            max_length=200
+        )
+
+        # Sampling
+        generated_ids_sample = model.generate(
+            input_ids,
+            decoder_strategy="sample",
+            temperature=0.7,
+            top_k=50,
+            top_p=0.9,
+            cognitive_memory_influence=0.3,
+            expert_confidence_threshold=0.7,
+            max_length=200
+        )
+
+    # Decode generated sequences
+    beam_text = tokenizer.decode(generated_ids_beam[0], skip_special_tokens=True)
+    greedy_text = tokenizer.decode(generated_ids_greedy[0], skip_special_tokens=True)
+    sample_text = tokenizer.decode(generated_ids_sample[0], skip_special_tokens=True)
+    # Decode the output
+    response = beam_text + " \n\n"+greedy_text+"\n\n"+sample_text
+    
+    return response
+
+def chat_loop(model: DecoderOnlyGPT, tokenizer: GPT2Tokenizer, device: torch.device):
+    """
+    Run an interactive chat loop with the model.
+    """
+    print("Chat with the AI (type 'quit' to exit):")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == 'quit':
+            break
+        
+        response = generate_response(model, tokenizer, user_input, device)
+        print("AI:", response)
+
+def main():
+    model_path = "checkpoint_epoch_2"  # Update this to your model's path
+    model, tokenizer, device = load_model_for_chat(model_path)
+    chat_loop(model, tokenizer, device)
 
 if __name__ == "__main__":
     main()

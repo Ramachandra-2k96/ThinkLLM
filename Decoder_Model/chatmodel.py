@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Tokenizer
 from tqdm.auto import tqdm
 from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
@@ -208,7 +208,6 @@ class ParallelDecisionTrees(nn.Module):
         combined = torch.cat(tree_outputs, dim=-1)
         return self.combiner(combined)
 
-# Update the DecoderOnlyConfig class
 class DecoderOnlyConfig(PretrainedConfig):
     def __init__(
         self,
@@ -234,6 +233,10 @@ class DecoderOnlyConfig(PretrainedConfig):
         use_cognitive_layer=True,
         use_ntk_layer=True,
         use_decision_trees=True,
+        learning_rate=5e-5,
+        max_grad_norm=1.0,
+        gradient_accumulation_steps=4,
+        warmup_ratio=0.1,
         **kwargs
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -258,6 +261,12 @@ class DecoderOnlyConfig(PretrainedConfig):
         self.use_cognitive_layer = use_cognitive_layer
         self.use_ntk_layer = use_ntk_layer
         self.use_decision_trees = use_decision_trees
+        
+        # New stability parameters
+        self.learning_rate = learning_rate
+        self.max_grad_norm = max_grad_norm
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.warmup_ratio = warmup_ratio
 
 class MixtureOfExperts(nn.Module):
     def __init__(self, config):
@@ -413,155 +422,277 @@ class DecoderOnlyGPT(PreTrainedModel):
             "logits": lm_logits,
             "hidden_states": hidden_states,
             "memory_states": memory_states,
+
         }
     def generate(
         self,
         input_ids,
-        max_length=50,
+        max_length=100,
         min_length=10,
-        do_sample=True,
-        temperature=1.0,
+        num_beams=4,
+        num_beam_groups=1,
+        diversity_penalty=0.0,
+        temperature=0.7,
         top_k=50,
-        top_p=0.95,
+        top_p=0.9,
         repetition_penalty=1.2,
+        length_penalty=1.0,
         pad_token_id=None,
         eos_token_id=None,
         attention_mask=None,
         num_return_sequences=1,
-        no_repeat_ngram_size=None
+        use_cache=True,
+        decoder_strategy="beam_search",  # Options: "beam_search", "greedy", "sample"
+        cognitive_memory_influence=0.3,
+        expert_confidence_threshold=0.7
     ):
-        # Set the model to evaluation mode
-        self.eval()
-        
-        # Move input_ids to the same device as the model
+        # Ensure proper device placement
         device = next(self.parameters()).device
         input_ids = input_ids.to(device)
+        batch_size = input_ids.shape[0]
+        vocab_size = self.config.vocab_size
         
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=device)
+        
+        class BeamHypotheses:
+            def __init__(self, num_beams, length_penalty, early_stopping=False):
+                self.max_length = max_length
+                self.num_beams = num_beams
+                self.length_penalty = length_penalty
+                self.early_stopping = early_stopping
+                self.beams = []
+                self.worst_score = 1e9
 
-        # Repeat input IDs for num_return_sequences
-        batch_size = input_ids.size(0)
-        input_ids = input_ids.repeat_interleave(num_return_sequences, dim=0)
-        
-        if attention_mask is not None:
-            attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
+            def add(self, hyp, sum_logprobs, cognitive_state=None, expert_usage=None):
+                score = sum_logprobs / (len(hyp) ** self.length_penalty)
+                if len(self.beams) < self.num_beams or score > self.worst_score:
+                    self.beams.append((score, hyp, cognitive_state, expert_usage))
+                    if len(self.beams) > self.num_beams:
+                        sorted_next_scores = sorted([(s, idx) for idx, (s, _, _, _) in enumerate(self.beams)])
+                        del self.beams[sorted_next_scores[0][1]]
+                        self.worst_score = sorted_next_scores[1][0]
+                    else:
+                        self.worst_score = min(score, self.worst_score)
 
-        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=device)
+        def get_expert_confidence(logits, expert_history):
+            if hasattr(self, 'h') and any(hasattr(layer.mlp, 'gate') for layer in self.h):
+                expert_weights = torch.softmax(logits, dim=-1)
+                top_expert = torch.argmax(expert_weights).item()
+                if expert_history and top_expert in expert_history:
+                    return expert_history[top_expert] / sum(expert_history.values())
+            return 0.0
+
+        def cognitive_state_similarity(state1, state2):
+            if state1 is None or state2 is None:
+                return 0.0
+            return F.cosine_similarity(state1.unsqueeze(0), state2.unsqueeze(0)).item()
+
+        # Initialize beam hypotheses for each batch
+        generated_hyps = [
+            BeamHypotheses(num_beams, length_penalty) 
+            for _ in range(batch_size)
+        ]
         
-        # To track generated n-grams if no_repeat_ngram_size is set
-        generated_ngrams = [{} for _ in range(input_ids.size(0))] if no_repeat_ngram_size else None
+        # Expand input for beam search
+        input_ids = input_ids.unsqueeze(1).expand(batch_size, num_beams, -1)
+        input_ids = input_ids.contiguous().view(batch_size * num_beams, -1)
+        attention_mask = attention_mask.unsqueeze(1).expand(batch_size, num_beams, -1)
+        attention_mask = attention_mask.contiguous().view(batch_size * num_beams, -1)
+        
+        # Initialize scores
+        beam_scores = torch.zeros((batch_size, num_beams), device=device)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)
+        
+        # Initialize cognitive states and expert tracking
+        cognitive_states = torch.zeros(batch_size * num_beams, self.config.n_embd, device=device)
+        expert_history = [{} for _ in range(batch_size * num_beams)]
+        
+        # Initialize dynamic cache for decoder
+        past_key_values = None if not use_cache else [None] * len(self.h)
+        
+        # Keep track of which sequences are already finished
+        done = [False for _ in range(batch_size)]
         
         with torch.no_grad():
-            while input_ids.shape[-1] < max_length:
-                # Forward pass
-                outputs = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
+            for step in range(max_length):
+                # Model forward pass
+                model_inputs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "past_key_values": past_key_values,
+                    "use_cache": use_cache,
+                }
+                outputs = self(**model_inputs)
                 
                 next_token_logits = outputs["logits"][:, -1, :] / temperature
+                past_key_values = outputs.get("past_key_values", past_key_values)
+                hidden_states = outputs.get("hidden_states", None)
                 
+                # Update cognitive states and expert confidence
+                if hidden_states is not None:
+                    for i, block in enumerate(self.h):
+                        if hasattr(block, 'cognitive'):
+                            new_cognitive_state = block.cognitive(hidden_states[:, -1:])[0].squeeze(1)
+                            cognitive_influence = cognitive_state_similarity(new_cognitive_state, cognitive_states)
+                            next_token_logits *= (1 + cognitive_influence * cognitive_memory_influence)
+                            cognitive_states = cognitive_states * 0.9 + new_cognitive_state * 0.1
+                        
+                        if hasattr(block.mlp, 'gate'):
+                            expert_logits = block.mlp.gate(hidden_states[:, -1])
+                            for b in range(batch_size * num_beams):
+                                expert_conf = get_expert_confidence(expert_logits[b], expert_history[b])
+                                if expert_conf > expert_confidence_threshold:
+                                    next_token_logits[b] *= (1 + expert_conf * 0.2)
+
                 # Apply repetition penalty
                 if repetition_penalty != 1.0:
-                    for i in range(input_ids.shape[0]):
+                    for i in range(batch_size * num_beams):
                         for previous_token in set(input_ids[i].tolist()):
                             next_token_logits[i, previous_token] /= repetition_penalty
                 
-                # Filter using top-k and top-p
-                if do_sample:
-                    # Top-k filtering
-                    if top_k > 0:
-                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                        next_token_logits[indices_to_remove] = float('-inf')
-                    
-                    # Top-p filtering
-                    if top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                        
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        
-                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                        next_token_logits[indices_to_remove] = float('-inf')
-                    
-                    # Sample from filtered distribution
-                    probs = torch.softmax(next_token_logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1)
+                if decoder_strategy == "beam_search":
+                    next_token_logits = _beam_search_step(
+                        next_token_logits, beam_scores, num_beams, 
+                        num_beam_groups, diversity_penalty, batch_size
+                    )
+                elif decoder_strategy == "sample":
+                    next_token_logits = _sample_step(next_token_logits, top_k, top_p, temperature)
+                # For greedy, we use logits as is
+                
+                next_token_scores = F.log_softmax(next_token_logits, dim=-1)
+                
+                if decoder_strategy == "greedy":
+                    next_tokens = torch.argmax(next_token_scores, dim=-1)
+                    next_scores = next_token_scores.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)
                 else:
-                    next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                    next_scores, next_tokens = torch.topk(
+                        next_token_scores, num_beams, dim=-1, 
+                        largest=True, sorted=True
+                    )
                 
-                # Check n-gram repetition
-                if no_repeat_ngram_size:
-                    for i, (tokens, ngrams) in enumerate(zip(input_ids, generated_ngrams)):
-                        generated_ngrams[i] = self.update_ngram_constraints(
-                            ngrams, tokens, next_tokens[i], no_repeat_ngram_size
-                        )
+                # Next beam indices
+                next_beam_indices = torch.div(next_tokens, vocab_size, rounding_mode='floor')
+                next_tokens = next_tokens % vocab_size
                 
-                # Update input_ids and attention_mask
-                input_ids = torch.cat([input_ids, next_tokens], dim=-1)
-                if attention_mask is not None:
-                    attention_mask = torch.cat([
-                        attention_mask,
-                        attention_mask.new_ones((attention_mask.shape[0], 1))
-                    ], dim=-1)
+                # Update beam indices
+                beam_outputs = {
+                    "next_beam_scores": next_scores.view(-1),
+                    "next_beam_tokens": next_tokens.view(-1),
+                    "next_beam_indices": next_beam_indices.view(-1),
+                }
                 
-                # Check if sequences are finished
-                if eos_token_id is not None:
-                    unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+                # Prepare for next iteration
+                input_ids = torch.cat([input_ids[beam_outputs["next_beam_indices"]], 
+                                    beam_outputs["next_beam_tokens"].unsqueeze(-1)], dim=-1)
                 
-                # Stop if all sequences are finished or max_length is reached
-                if unfinished_sequences.max() == 0 or input_ids.shape[-1] >= max_length:
+                attention_mask = torch.cat([
+                    attention_mask[beam_outputs["next_beam_indices"]],
+                    attention_mask.new_ones((attention_mask.shape[0], 1))
+                ], dim=-1)
+                
+                beam_scores = beam_outputs["next_beam_scores"]
+                
+                # Update cognitive states and expert history for next iteration
+                cognitive_states = cognitive_states[beam_outputs["next_beam_indices"]]
+                expert_history = [expert_history[i] for i in beam_outputs["next_beam_indices"].tolist()]
+                
+                # Check if we're done
+                for batch_idx in range(batch_size):
+                    if not done[batch_idx]:
+                        for beam_id in range(num_beams):
+                            batch_beam_idx = batch_idx * num_beams + beam_id
+                            if eos_token_id is not None and beam_outputs["next_beam_tokens"][batch_beam_idx].item() == eos_token_id:
+                                if step >= min_length:
+                                    generated_hyps[batch_idx].add(
+                                        input_ids[batch_beam_idx].clone(),
+                                        beam_scores[batch_beam_idx].item(),
+                                        cognitive_states[batch_beam_idx].clone(),
+                                        expert_history[batch_beam_idx].copy()
+                                    )
+                
+                # Check if all beams are done
+                done = [(hyp.num_beams == len(hyp.beams) and len(hyp.beams) >= num_return_sequences)
+                    for hyp in generated_hyps]
+                if all(done):
                     break
         
-        # Reshape output if num_return_sequences > 1
-        if num_return_sequences > 1:
-            return input_ids.view(batch_size, num_return_sequences, -1)
+        # Select best hypotheses
+        output_sequences = []
+        output_cognitive_states = []
+        output_expert_histories = []
         
-        return input_ids
-
-    def update_ngram_constraints(self, ngrams, input_seq, next_token, n):
-        """Helper function to update n-gram tracking for no_repeat_ngram_size."""
-        if len(input_seq) >= n - 1:
-            gram = tuple(input_seq[-(n-1):].tolist())
-            if gram in ngrams and next_token.item() in ngrams[gram]:
-                # Find the next best token that doesn't create a repeated n-gram
-                logits = self(input_ids=input_seq.unsqueeze(0))["logits"][0, -1]
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                for new_token in sorted_indices:
-                    if gram not in ngrams or new_token.item() not in ngrams[gram]:
-                        next_token.fill_(new_token.item())
-                        break
-            ngrams.setdefault(gram, set()).add(next_token.item())
-        return ngrams
-
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
+        for i, hyp in enumerate(generated_hyps):
+            sorted_hyps = sorted(hyp.beams, key=lambda x: x[0], reverse=True)
+            for j in range(min(len(sorted_hyps), num_return_sequences)):
+                output_sequences.append(sorted_hyps[j][1])
+                if sorted_hyps[j][2] is not None:  # cognitive state
+                    output_cognitive_states.append(sorted_hyps[j][2])
+                if sorted_hyps[j][3] is not None:  # expert history
+                    output_expert_histories.append(sorted_hyps[j][3])
+        
+        # Prepare output
+        output_sequences = torch.stack(output_sequences) if len(output_sequences) > 1 else output_sequences[0].unsqueeze(0)
+        
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "sequences": output_sequences,
+            "cognitive_states": output_cognitive_states if output_cognitive_states else None,
+            "expert_histories": output_expert_histories if output_expert_histories else None
         }
+
+def _beam_search_step(logits, scores, num_beams, num_beam_groups, diversity_penalty, batch_size):
+    vocab_size = logits.shape[-1]
+    
+    # Calculate log probabilities
+    next_scores = F.log_softmax(logits, dim=-1)
+    
+    # Add diversity penalty between beam groups
+    if num_beam_groups > 1:
+        diversity_group_size = num_beams // num_beam_groups
+        for batch_idx in range(batch_size):
+            for group_idx in range(num_beam_groups):
+                group_start = group_idx * diversity_group_size
+                group_end = (group_idx + 1) * diversity_group_size
+                group_scores = next_scores[batch_idx * num_beams + group_start:batch_idx * num_beams + group_end]
+                
+                # Apply diversity penalty
+                for other_group_idx in range(num_beam_groups):
+                    if other_group_idx != group_idx:
+                        other_group_start = other_group_idx * diversity_group_size
+                        other_group_end = (other_group_idx + 1) * diversity_group_size
+                        other_group_scores = next_scores[batch_idx * num_beams + other_group_start:batch_idx * num_beams + other_group_end]
+                        
+                        penalty = torch.max(other_group_scores, dim=0)[0] * diversity_penalty
+                        group_scores -= penalty
+    
+    return next_scores
+
+def _sample_step(logits, top_k, top_p, temperature):
+    # Top-k filtering
+    if top_k > 0:
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = float('-inf')
+    
+    # Top-p filtering
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = float('-inf')
+    
+    return logits
 
 import os
 import torch
 from transformers import PreTrainedModel
 
-def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, train_loss_history, scaler, path):
-    """
-    Save the enhanced model and all training state in HuggingFace format with improved error handling.
-    
-    Args:
-        model: The DecoderOnlyGPT model
-        optimizer: The optimizer used for training
-        scheduler: The learning rate scheduler
-        tokenizer: The tokenizer used with the model
-        config: The model configuration
-        epoch: Current training epoch
-        train_loss_history: List of training losses
-        scaler: The GradScaler used for mixed precision training
-        path: Directory path to save the model and associated files
-    """
+def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, train_loss_history, path):
     try:
         # Create directory if it doesn't exist
         os.makedirs(path, exist_ok=True)
@@ -587,7 +718,6 @@ def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, t
             'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
             'train_loss_history': train_loss_history,
-            'scaler': scaler.state_dict() if scaler else None,
         }
         
         # 5. Save additional components
@@ -617,17 +747,59 @@ def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, t
         raise
 
 def load_enhanced_model(path, training=False):
-    """
-    Load the enhanced model and optionally training state.
+    # 1. Load config and model
+    config = DecoderOnlyConfig.from_pretrained(path)
+    model = DecoderOnlyGPT.from_pretrained(path, config=config)
     
-    Args:
-        path: Path to the saved model directory
-        training: Whether to load training state (optimizer, scheduler, etc.)
+    # 2. Load tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(path)
     
-    Returns:
-        If training=False: model, tokenizer
-        If training=True: model, tokenizer, optimizer, scheduler, start_epoch, train_loss_history, scaler
-    """
+    if not training:
+        return model, tokenizer
+    
+    # 3. Load training state
+    training_state_path = os.path.join(path, 'training_state.bin')
+    if not os.path.exists(training_state_path):
+        raise FileNotFoundError(f"Training state not found at {training_state_path}")
+    
+    full_state = torch.load(training_state_path)
+    training_state = full_state['training_state']
+    additional_components = full_state['additional_components']
+    
+    # 4. Restore additional components
+    for i, block in enumerate(model.h):
+        if hasattr(block.mlp, 'experts'):
+            block.mlp.load_state_dict(additional_components['moe_states'][i])
+        if hasattr(block, 'ntk'):
+            block.ntk.load_state_dict(additional_components['ntk_states'][i])
+        if hasattr(block, 'decision_trees'):
+            block.decision_trees.load_state_dict(additional_components['decision_tree_states'][i])
+        if hasattr(block, 'cognitive'):
+            block.cognitive.load_state_dict(additional_components['cognitive_states'][i])
+    
+    # 5. Create and load optimizer
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer.load_state_dict(training_state['optimizer_state_dict'])
+    
+    # 6. Create and load scheduler if it exists
+    scheduler = None
+    if training_state['scheduler_state_dict'] is not None:
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=config.num_training_steps
+        )
+        scheduler.load_state_dict(training_state['scheduler_state_dict'])
+    
+    # 7. Restore memory states if they exist
+    if 'memory_states' in training_state:
+        for i, block in enumerate(model.h):
+            if hasattr(block, 'cognitive'):
+                block.cognitive.memory_state = training_state['memory_states'][i]
+    
+    return model, tokenizer, optimizer, scheduler, training_state['epoch'], training_state['train_loss_history']
+
+def load_enhanced_model(path, training=False):
     import os
     from transformers import GPT2Tokenizer
     
@@ -668,7 +840,7 @@ def load_enhanced_model(path, training=False):
     # 6. Create and load scheduler if it exists
     scheduler = None
     if training_state['scheduler_state_dict'] is not None:
-        scheduler = get_linear_schedule_with_warmup(
+        scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=config.warmup_steps,
             num_training_steps=config.num_training_steps
@@ -687,83 +859,109 @@ def load_enhanced_model(path, training=False):
     
     return model, tokenizer, optimizer, scheduler, training_state['epoch'], training_state['train_loss_history'], scaler
 
-
 def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_loss_history=None):
-    """
-    Train the chatbot model with mixed precision and enhanced save functionality.
-    
-    Args:
-        model: The DecoderOnlyGPT model
-        tokenizer: The tokenizer used with the model
-        dataset: The dataset to train on
-        config: Training configuration
-        start_epoch: Epoch to start training from (default: 0)
-        train_loss_history: Previous training loss history (default: None)
-    
-    Returns:
-        tuple: (trained model, training loss history)
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
-    # Initialize mixed precision training
-    scaler = torch.amp.GradScaler()
+    # Create DataLoader with gradient accumulation
+    effective_batch_size = config.batch_size * config.gradient_accumulation_steps
+    train_loader = DataLoader(
+        dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True,
+        pin_memory=True
+    )
     
-    train_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    # Initialize optimizer with gradient clipping
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        eps=1e-8,  # Increased epsilon for numerical stability
+        weight_decay=0.01  # L2 regularization to prevent extreme weights
+    )
     
-    num_training_steps = len(train_loader) * config.num_epochs
-    scheduler = get_linear_schedule_with_warmup(
+    num_training_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
+    warmup_steps = min(1000, num_training_steps // 10)  # Dynamic warmup
+    
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=config.warmup_steps,
+        num_warmup_steps=warmup_steps,
         num_training_steps=num_training_steps
     )
     
     if train_loss_history is None:
         train_loss_history = []
-
+    
+    # Initialize gradient norm tracking
+    grad_norm_moving_avg = 0.0
+    beta = 0.98  # For exponential moving average
+    
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
         total_loss = 0
+        optimizer.zero_grad()
+        
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
         
-        for batch in progress_bar:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            
-            # Automatic mixed precision context
-            with torch.amp.autocast('cuda'):
-                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs['loss']
-            
-            # Scale the loss and call backward
-            scaler.scale(loss).backward()
-            
-            # Unscale before gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            # Step optimizer and update scaler
-            scaler.step(optimizer)
-            scaler.update()
-            
-            scheduler.step()
-            optimizer.zero_grad()
-            
-            total_loss += loss.item()
-            
-            progress_bar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'avg_loss': f"{total_loss / (progress_bar.n + 1):.4f}",
-                'lr': f"{scheduler.get_last_lr()[0]:.2e}"
-            })
+        for step, batch in enumerate(progress_bar):
+            try:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                
+                # Forward pass
+                outputs = model(
+                    input_ids, 
+                    attention_mask=attention_mask, 
+                    labels=labels
+                )
+                loss = outputs['loss'] / config.gradient_accumulation_steps
+                
+                # Check for NaN loss before backward pass
+                if torch.isnan(loss).any() or torch.isinf(loss).any():
+                    print(f"NaN/Inf detected in loss at step {step}. Skipping batch.")
+                    continue
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient accumulation
+                if (step + 1) % config.gradient_accumulation_steps == 0:
+                    # Calculate gradient norm
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    
+                    # Update gradient norm moving average
+                    grad_norm_moving_avg = beta * grad_norm_moving_avg + (1 - beta) * grad_norm
+                    
+                    # Adjust learning rate based on gradient norm
+                    if grad_norm_moving_avg > config.max_grad_norm:
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] *= 0.9
+                    
+                    # Step optimizer and scheduler
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                
+                # Update progress bar
+                current_lr = scheduler.get_last_lr()[0]
+                progress_bar.set_postfix({
+                    'loss': f"{loss.item() * config.gradient_accumulation_steps:.4f}",
+                    'lr': f"{current_lr:.2e}",
+                    'grad_norm': f"{grad_norm_moving_avg:.2f}",
+                })
+                
+                total_loss += loss.item() * config.gradient_accumulation_steps
+                
+            except RuntimeError as e:
+                print(f"Error during training: {str(e)}")
+                continue
         
         avg_loss = total_loss / len(train_loader)
         train_loss_history.append(avg_loss)
         print(f"Epoch {epoch+1}/{config.num_epochs}, Average Loss: {avg_loss:.4f}")
         
-        # Save checkpoint after each epoch
+        # Save checkpoint
         save_enhanced_model(
             model=model,
             optimizer=optimizer,
@@ -772,11 +970,10 @@ def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_
             config=config,
             epoch=epoch+1,
             train_loss_history=train_loss_history,
-            scaler=scaler,  # Add scaler to saved state
             path=f"checkpoint_epoch_{epoch+1}"
         )
     
-    return model, train_loss_history, scaler, scheduler, optimizer
+    return model, train_loss_history, scheduler, optimizer
 
 class WikipediaDataset(Dataset):
     def __init__(self, tokenizer, max_length=512, num_examples=None):
@@ -788,9 +985,10 @@ class WikipediaDataset(Dataset):
         
         # Use RecursiveCharacterTextSplitter from LangChain
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=max_length,
+            chunk_overlap=18,
             length_function=len,
+            separators=["\n\n", "\n", "."]
         )
         
         self.texts = []
@@ -827,11 +1025,10 @@ def main(num_examples=None, resume_from=None):
     training_config = {
         'batch_size': 2,
         'num_epochs': 3,
-        'learning_rate': 5e-5,
+        'learning_rate': 1e-4,
         'warmup_steps': 100,
         'max_length': 512,
     }
-
     # Initialize tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2",clean_up_tokenization_spaces=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -846,74 +1043,59 @@ def main(num_examples=None, resume_from=None):
         print("Initializing new model")
         config = DecoderOnlyConfig(
             vocab_size=tokenizer.vocab_size,
-            n_positions=training_config['max_length'],
+            n_positions=512,
             n_embd=512,
-            n_layer=8,
+            n_layer=6,
             n_head=8,
             n_inner=1536,
-            learning_rate=training_config['learning_rate'],
-            num_epochs=training_config['num_epochs'],
-            batch_size=training_config['batch_size'],
-            warmup_steps=training_config['warmup_steps'],
+            learning_rate=training_config['learning_rate'], 
+            gradient_accumulation_steps=4,
+            max_grad_norm=1.0,
+            warmup_ratio=0.1,
             use_moe=True,
             num_experts=2,
             top_k_experts=2,
             use_cognitive_layer=True,
             use_ntk_layer=True,
-            use_decision_trees=True
+            use_decision_trees=True,
+            num_epochs=training_config['num_epochs'],
+            batch_size=training_config['batch_size'],
+            warmup_steps=training_config['warmup_steps'],
         )
         model = DecoderOnlyGPT(config)
         start_epoch = 0
         train_loss_history = None
 
     # Create dataset
-    print(f"Creating dataset with {'all examples' if num_examples is None else f'{num_examples} examples'}")
     dataset = WikipediaDataset(
         tokenizer, 
-        max_length=training_config['max_length'],
+        max_length=config.n_positions,
         num_examples=num_examples
     )
 
-    # Update config with correct number of training steps
-    num_training_steps = len(dataset) // training_config['batch_size'] * training_config['num_epochs']
-    model.config.num_training_steps = num_training_steps
-
-    # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Move model to device
-    model = model.to(device)
-
     # Train the model
-    print("Starting training...")
-    trained_model, final_loss_history, scaler, scheduler, optimizer = train_chatbot_model(
+    model, train_loss_history, scheduler, optimizer = train_chatbot_model(
         model=model,
         tokenizer=tokenizer,
         dataset=dataset,
-        config=model.config,
+        config=config,
         start_epoch=start_epoch,
         train_loss_history=train_loss_history
     )
 
-    # Save the final trained model
-    final_save_path = "final_enhanced_wikipedia_chatbot"
-    print(f"Saving final model to {final_save_path}")
+    # Save the final model
     save_enhanced_model(
-        model=trained_model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        tokenizer=tokenizer,
-        config=model.config,
-        epoch=model.config.num_epochs,
-        train_loss_history=final_loss_history,
-        scaler=scaler,
-        path=final_save_path
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            tokenizer=tokenizer,
+            config=config,
+            epoch=config.num_epochs,
+            train_loss_history=train_loss_history,
+            path="final_enhanced_wikipedia_chatbot"
     )
 
-    print(f"\nTraining completed. Final model saved to {final_save_path}")
-
-    return trained_model, tokenizer, final_loss_history
+    return trained_model, tokenizer, train_loss_history
 
 if __name__ == "__main__":
     import argparse
