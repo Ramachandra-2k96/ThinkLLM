@@ -1,3 +1,12 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import PreTrainedModel, PretrainedConfig
+from torch.optim import AdamW
+from transformers import get_cosine_schedule_with_warmup
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 import re
 import torch
 import torch.nn as nn
@@ -17,86 +26,67 @@ from transformers import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
+from transformers.generation.utils import GenerationMixin
 
-class AdaptiveInputEmbedding(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.adaptive_span = nn.Parameter(torch.ones(config.vocab_size))
-        self.base_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.context_projector = nn.Linear(config.n_embd, config.n_embd)
+class EnhancedDecoderOnlyConfig(PretrainedConfig):
+    def __init__(
+        self,
+        vocab_size=50257,
+        n_positions=1024,
+        n_embd=768,
+        n_layer=12,
+        n_head=12,
+        n_inner=None,
+        activation_function="gelu_new",
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        tie_word_embeddings=True,
+        use_moe=False,
+        num_experts=4,
+        top_k_experts=2,
+        use_cognitive_layer=True,
+        use_ntk_layer=True,
+        use_decision_trees=True,
+        learning_rate=5e-5,
+        max_grad_norm=1.0,
+        gradient_accumulation_steps=4,
+        warmup_ratio=0.1,
+        label_smoothing=0.1,
+        **kwargs
+    ):
+        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
         
-    def forward(self, input_ids):
-        # Get base embeddings
-        base_embeds = self.base_embedding(input_ids)
-        
-        # Apply adaptive span attention
-        span_weights = F.softmax(self.adaptive_span, dim=0)
-        span_weights = span_weights[input_ids].unsqueeze(-1)
-        
-        # Project embeddings based on context
-        context_embeds = self.context_projector(base_embeds)
-        
-        # Combine adaptively
-        return span_weights * context_embeds + (1 - span_weights) * base_embeds
-    
-class HierarchicalCompression(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.compression_layers = nn.ModuleList([
-            nn.Conv1d(config.n_embd, config.n_embd, kernel_size=2, stride=1, padding=1)
-            for _ in range(3)  # 3 levels of compression
-        ])
-        self.decompression_layers = nn.ModuleList([
-            nn.ConvTranspose1d(config.n_embd, config.n_embd, kernel_size=2, stride=1, padding=1)
-            for _ in range(3)
-        ])
-        
-    def forward(self, hidden_states):
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # Compress
-        x = hidden_states.transpose(1, 2)  # [batch, hidden, seq]
-        compressed_features = []
-        for layer in self.compression_layers:
-            x = F.gelu(layer(x))
-            compressed_features.append(x)
-        
-        # Decompress
-        for i, layer in enumerate(self.decompression_layers):
-            x = F.gelu(layer(x))
-            if i < len(compressed_features) - 1:
-                x = x + compressed_features[-(i+2)]  # Skip connections
-                
-        return x.transpose(1, 2)  # [batch, seq, hidden]
-    
-class SemanticMemoryModule(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.num_concepts = 1000
-        self.concept_dim = config.n_embd
-        
-        # Learnable concept embeddings
-        self.concept_embeddings = nn.Parameter(
-            torch.randn(self.num_concepts, self.concept_dim)
-        )
-        
-        self.concept_projector = nn.Linear(config.n_embd, self.concept_dim)
-        self.output_projector = nn.Linear(self.concept_dim, config.n_embd)
-        
-    def forward(self, hidden_states):
-        # Project hidden states to concept space
-        projected_states = self.concept_projector(hidden_states)
-        
-        # Compute attention with concepts
-        attention_scores = torch.matmul(projected_states, self.concept_embeddings.t())
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        
-        # Weighted sum of concepts
-        concept_mixture = torch.matmul(attention_probs, self.concept_embeddings)
-        
-        # Project back to hidden space
-        return self.output_projector(concept_mixture)
-    
+        self.vocab_size = vocab_size
+        self.n_positions = n_positions
+        self.n_embd = n_embd
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_inner = n_inner
+        self.activation_function = activation_function
+        self.resid_pdrop = resid_pdrop
+        self.embd_pdrop = embd_pdrop
+        self.attn_pdrop = attn_pdrop
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.tie_word_embeddings = tie_word_embeddings
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.top_k_experts = top_k_experts
+        self.use_cognitive_layer = use_cognitive_layer
+        self.use_ntk_layer = use_ntk_layer
+        self.use_decision_trees = use_decision_trees
+        self.learning_rate = learning_rate
+        self.max_grad_norm = max_grad_norm
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.warmup_ratio = warmup_ratio
+        self.label_smoothing = label_smoothing
 
 class CognitiveLayer(nn.Module):
     def __init__(self, config):
@@ -282,12 +272,13 @@ class DecoderOnlyMLP(nn.Module):
         hidden_states = self.c_proj(hidden_states)
         hidden_states = self.dropout(hidden_states)
         return hidden_states
-    
+
+
 class ParallelDecisionTrees(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_trees = 2  # Reduced from 4 to 2 for efficiency
-        self.depth = 2      # Reduced from 3 to 2 for efficiency
+        self.depth = 3      # Reduced from 3 to 2 for efficiency
         
         self.trees = nn.ModuleList([
             DecisionTree(config.n_embd, depth=self.depth) for _ in range(self.num_trees)
@@ -298,66 +289,6 @@ class ParallelDecisionTrees(nn.Module):
         tree_outputs = [tree(x) for tree in self.trees]
         combined = torch.cat(tree_outputs, dim=-1)
         return self.combiner(combined)
-
-class DecoderOnlyConfig(PretrainedConfig):
-    def __init__(
-        self,
-        vocab_size=50257,
-        n_positions=1024,
-        n_embd=768,
-        n_layer=12,
-        n_head=12,
-        n_inner=None,
-        activation_function="gelu_new",
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        use_cache=True,
-        bos_token_id=50256,
-        eos_token_id=50256,
-        tie_word_embeddings=True,
-        use_moe=False,
-        num_experts=4,
-        top_k_experts=2,
-        use_cognitive_layer=True,
-        use_ntk_layer=True,
-        use_decision_trees=True,
-        learning_rate=5e-5,
-        max_grad_norm=1.0,
-        gradient_accumulation_steps=4,
-        warmup_ratio=0.1,
-        **kwargs
-    ):
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
-        
-        self.vocab_size = vocab_size
-        self.n_positions = n_positions
-        self.n_embd = n_embd
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_inner = n_inner
-        self.activation_function = activation_function
-        self.resid_pdrop = resid_pdrop
-        self.embd_pdrop = embd_pdrop
-        self.attn_pdrop = attn_pdrop
-        self.layer_norm_epsilon = layer_norm_epsilon
-        self.initializer_range = initializer_range
-        self.use_cache = use_cache
-        self.tie_word_embeddings = tie_word_embeddings
-        self.use_moe = use_moe
-        self.num_experts = num_experts
-        self.top_k_experts = top_k_experts
-        self.use_cognitive_layer = use_cognitive_layer
-        self.use_ntk_layer = use_ntk_layer
-        self.use_decision_trees = use_decision_trees
-        
-        # New stability parameters
-        self.learning_rate = learning_rate
-        self.max_grad_norm = max_grad_norm
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.warmup_ratio = warmup_ratio
 
 class MixtureOfExperts(nn.Module):
     def __init__(self, config):
@@ -385,16 +316,13 @@ class MixtureOfExperts(nn.Module):
         
         return output
     
-class ImprovedDecoderOnlyBlock(nn.Module):
+# Update the DecoderOnlyBlock class
+class DecoderOnlyBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.attn = DecoderOnlyAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        
-        # Enhanced components
-        self.hierarchical_comp = HierarchicalCompression(config)
-        self.semantic_memory = SemanticMemoryModule(config)
         
         if config.use_moe:
             self.mlp = MixtureOfExperts(config)
@@ -414,14 +342,6 @@ class ImprovedDecoderOnlyBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         
-        # Apply hierarchical compression
-        compressed_states = self.hierarchical_comp(hidden_states)
-        hidden_states = hidden_states + compressed_states
-        
-        # Apply semantic memory
-        semantic_states = self.semantic_memory(hidden_states)
-        hidden_states = hidden_states + semantic_states
-        
         attn_outputs = self.attn(
             hidden_states,
             attention_mask=attention_mask,
@@ -429,7 +349,6 @@ class ImprovedDecoderOnlyBlock(nn.Module):
             past_key_value=past_key_value
         )
         
-        # Rest of the forward pass remains the same
         if isinstance(attn_outputs, tuple):
             attn_output = attn_outputs[0]
             present_key_value = attn_outputs[1] if len(attn_outputs) > 1 else None
@@ -465,31 +384,58 @@ class ImprovedDecoderOnlyBlock(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
             
-        return hidden_states, new_memory_state, present_key_value if use_cache else None
-
-class ImprovedDecoderOnlyGPT(PreTrainedModel):
+        return outputs
+    
+class EnhancedDecoderOnlyGPT(PreTrainedModel,GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
         
-        # Replace standard embedding with adaptive embedding
-        self.wte = AdaptiveInputEmbedding(config)
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
         self.drop = nn.Dropout(config.embd_pdrop)
-        
-        # Use improved decoder blocks
-        self.h = nn.ModuleList([ImprovedDecoderOnlyBlock(config) for _ in range(config.n_layer)])
-        
+        self.h = nn.ModuleList([EnhancedDecoderOnlyBlock(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         
         if config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-            self.lm_head.weight = self.wte.base_embedding.weight
+            self.lm_head.weight = self.wte.weight
         else:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
             
         self.init_weights()
         
+    def get_output_embeddings(self):
+        return self.lm_head
+    def init_weights(self):
+        # Apply a custom initialization to each module
+        for module in self.modules():
+            # Xavier Initialization for Linear Layers
+            if isinstance(module, nn.Linear):
+                if module.weight.requires_grad:
+                    nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            
+            # He Initialization for Layers with ReLU activations
+            elif isinstance(module, (nn.Conv2d, nn.Conv1d)):
+                if module.weight.requires_grad:
+                    nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            
+            # Uniform Initialization for Embedding Layers
+            elif isinstance(module, nn.Embedding):
+                nn.init.uniform_(module.weight, -0.1, 0.1)
+
+            # LayerNorm is generally well-initialized by default, but you can set bias and weight if needed
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
     def forward(
         self,
         input_ids=None,
@@ -578,255 +524,117 @@ class ImprovedDecoderOnlyGPT(PreTrainedModel):
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing)
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
         return {
             "loss": loss,
             "logits": lm_logits,
             "hidden_states": hidden_states,
-            "memory_states": memory_states,
             "presents": presents,
             "all_hidden_states": all_hidden_states,
             "all_attentions": all_attentions,
         }
-    def generate(self, input_ids, attention_mask=None, max_length=100, temperature=1.0, top_k=0, top_p=0.9, repetition_penalty=1.0, do_sample=True, pad_token_id=None):
-        device = input_ids.device
-        batch_size = input_ids.size(0)
+    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
+        token_type_ids = kwargs.get("token_type_ids", None)
+        # only last token for inputs_ids if past is defined in kwargs
+        if past:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
 
-        if pad_token_id is None:
-            pad_token_id = self.config.eos_token_id
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
 
-        generated = input_ids.clone()
-        past_key_values = None
-        memory_states = [None] * len(self.h)
-
-        for _ in range(max_length - input_ids.size(1)):
-            outputs = self(generated, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
-            logits = outputs['logits'][:, -1, :] / temperature
-            past_key_values = outputs.get('presents', None)
-
-            # Update memory states
-            memory_states = outputs.get('memory_states', memory_states)
-
-            # Apply repetition penalty
-            if repetition_penalty != 1.0:
-                for i in range(batch_size):
-                    for token_id in set(generated[i].tolist()):
-                        logits[i, token_id] /= repetition_penalty
-
-            # Apply top-k and top-p filtering
-            filtered_logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-
-            if do_sample:
-                probs = F.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(filtered_logits, dim=-1).unsqueeze(-1)
-
-            generated = torch.cat([generated, next_token], dim=1)
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=1) if attention_mask is not None else None
-
-            if next_token.item() == pad_token_id:
-                break
-
-        return generated
-
-def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
-    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering """
-    top_k = min(top_k, logits.size(-1))  # Safety check
-    if top_k > 0:
-        # Remove all tokens with a probability less than the last token of the top-k
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-        logits[indices_to_remove] = filter_value
-
-    if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-        # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift the indices to the right to keep also the first token above the threshold
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        logits[indices_to_remove] = filter_value
-    return logits
-
-def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, train_loss_history, path):
-    try:
-        # Create directory if it doesn't exist
-        os.makedirs(path, exist_ok=True)
-        
-        # 1. Save the model state
-        model_to_save = model.module if hasattr(model, 'module') else model
-        if isinstance(model_to_save, PreTrainedModel):
-            model_to_save.save_pretrained(path, safe_serialization=False)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
-            torch.save(model_to_save.state_dict(), os.path.join(path, 'pytorch_model.bin'))
-        
-        # 2. Save the tokenizer
-        if tokenizer is not None:
-            tokenizer.save_pretrained(path)
-        
-        # 3. Save the config
-        if config is not None:
-            config.save_pretrained(path)
-        
-        # 4. Save the training state
-        training_state = {
-            'epoch': epoch,
-            'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'train_loss_history': train_loss_history,
+            position_ids = None
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past,
+            "use_cache": kwargs.get("use_cache"),
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
         }
+    
+class EnhancedDecoderOnlyBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+        self.attn =DecoderOnlyAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         
-        # 5. Save additional components
-        additional_components = {}
-        for i, block in enumerate(model.h):
-            if hasattr(block, 'mlp') and hasattr(block.mlp, 'experts'):
-                additional_components.setdefault('moe_states', {})[i] = block.mlp.state_dict()
-            if hasattr(block, 'ntk'):
-                additional_components.setdefault('ntk_states', {})[i] = block.ntk.state_dict()
-            if hasattr(block, 'decision_trees'):
-                additional_components.setdefault('decision_tree_states', {})[i] = block.decision_trees.state_dict()
-            if hasattr(block, 'cognitive'):
-                additional_components.setdefault('cognitive_states', {})[i] = block.cognitive.state_dict()
+        if config.use_moe:
+            self.mlp = MixtureOfExperts(config)
+        else:
+            self.mlp = DecoderOnlyMLP(config)
+            
+        if config.use_cognitive_layer:
+            self.cognitive = CognitiveLayer(config)
+            self.ln_cognitive = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         
-        # Combine all states
-        full_state = {
-            'training_state': training_state,
-            'additional_components': additional_components
-        }
+        if config.use_ntk_layer:
+            self.ntk = DynamicNTKLayer(config)
+            self.ln_ntk = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+            
+        if config.use_decision_trees:
+            self.decision_trees = ParallelDecisionTrees(config)
+            self.ln_decision_trees = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+            
+    def forward(self, hidden_states, attention_mask=None, memory_state=None, use_cache=False, past_key_value=None):
+        residual = hidden_states
+        hidden_states = self.ln_1(hidden_states)
         
-        # Save the combined state
-        torch.save(full_state, os.path.join(path, 'training_state.bin'))
-        
-        print(f"Model and training state successfully saved to {path}")
-    except Exception as e:
-        print(f"Error occurred while saving the model: {str(e)}")
-        raise
-
-def load_enhanced_model(path, training=False):
-    # 1. Load config and model
-    config = DecoderOnlyConfig.from_pretrained(path)
-    model = ImprovedDecoderOnlyGPT.from_pretrained(path, config=config)
-    
-    # 2. Load tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained(path)
-    
-    if not training:
-        return model, tokenizer
-    
-    # 3. Load training state
-    training_state_path = os.path.join(path, 'training_state.bin')
-    if not os.path.exists(training_state_path):
-        raise FileNotFoundError(f"Training state not found at {training_state_path}")
-    
-    full_state = torch.load(training_state_path)
-    training_state = full_state['training_state']
-    additional_components = full_state['additional_components']
-    
-    # 4. Restore additional components
-    for i, block in enumerate(model.h):
-        if hasattr(block.mlp, 'experts'):
-            block.mlp.load_state_dict(additional_components['moe_states'][i])
-        if hasattr(block, 'ntk'):
-            block.ntk.load_state_dict(additional_components['ntk_states'][i])
-        if hasattr(block, 'decision_trees'):
-            block.decision_trees.load_state_dict(additional_components['decision_tree_states'][i])
-        if hasattr(block, 'cognitive'):
-            block.cognitive.load_state_dict(additional_components['cognitive_states'][i])
-    
-    # 5. Create and load optimizer
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
-    optimizer.load_state_dict(training_state['optimizer_state_dict'])
-    
-    # 6. Create and load scheduler if it exists
-    scheduler = None
-    if training_state['scheduler_state_dict'] is not None:
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=config.warmup_steps,
-            num_training_steps=config.num_training_steps
+        attn_outputs = self.attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            past_key_value=past_key_value
         )
-        scheduler.load_state_dict(training_state['scheduler_state_dict'])
-    
-    # 7. Restore memory states if they exist
-    if 'memory_states' in training_state:
-        for i, block in enumerate(model.h):
-            if hasattr(block, 'cognitive'):
-                block.cognitive.memory_state = training_state['memory_states'][i]
-    
-    return model, tokenizer, optimizer, scheduler, training_state['epoch'], training_state['train_loss_history']
+        
+        hidden_states = residual + attn_outputs[0]
+        
+        if hasattr(self, 'cognitive'):
+            residual = hidden_states
+            hidden_states = self.ln_cognitive(hidden_states)
+            cognitive_output, new_memory_state = self.cognitive(hidden_states, memory_state)
+            hidden_states = residual + cognitive_output
+            
+        if hasattr(self, 'ntk'):
+            residual = hidden_states
+            hidden_states = self.ln_ntk(hidden_states)
+            ntk_output = self.ntk(hidden_states)
+            hidden_states = residual + ntk_output
+            
+        residual = hidden_states
+        hidden_states = self.ln_2(hidden_states)
+        mlp_output = self.mlp(hidden_states)
+        hidden_states = residual + mlp_output
+        
+        if hasattr(self, 'decision_trees'):
+            residual = hidden_states
+            hidden_states = self.ln_decision_trees(hidden_states)
+            tree_output = self.decision_trees(hidden_states)
+            hidden_states = residual + tree_output
+            
+        outputs = (hidden_states,) + attn_outputs[1:]
+        
+        if hasattr(self, 'cognitive'):
+            outputs += (new_memory_state,)
+            
+        return outputs
 
-def load_enhanced_model(path, training=False):
-    import os
-    from transformers import GPT2Tokenizer
-    
-    # 1. Load config and model
-    config = DecoderOnlyConfig.from_pretrained(path)
-    model = ImprovedDecoderOnlyGPT.from_pretrained(path, config=config)
-    
-    # 2. Load tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained(path)
-    
-    if not training:
-        return model, tokenizer
-    
-    # 3. Load training state
-    training_state_path = os.path.join(path, 'training_state.bin')
-    if not os.path.exists(training_state_path):
-        raise FileNotFoundError(f"Training state not found at {training_state_path}")
-    
-    full_state = torch.load(training_state_path)
-    training_state = full_state['training_state']
-    additional_components = full_state['additional_components']
-    
-    # 4. Restore additional components
-    for i, block in enumerate(model.h):
-        if hasattr(block.mlp, 'experts'):
-            block.mlp.load_state_dict(additional_components['moe_states'][i])
-        if hasattr(block, 'ntk'):
-            block.ntk.load_state_dict(additional_components['ntk_states'][i])
-        if hasattr(block, 'decision_trees'):
-            block.decision_trees.load_state_dict(additional_components['decision_tree_states'][i])
-        if hasattr(block, 'cognitive'):
-            block.cognitive.load_state_dict(additional_components['cognitive_states'][i])
-    
-    # 5. Create and load optimizer
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
-    optimizer.load_state_dict(training_state['optimizer_state_dict'])
-    
-    # 6. Create and load scheduler if it exists
-    scheduler = None
-    if training_state['scheduler_state_dict'] is not None:
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=config.warmup_steps,
-            num_training_steps=config.num_training_steps
-        )
-        scheduler.load_state_dict(training_state['scheduler_state_dict'])
-    
-    # 7. Restore memory states if they exist
-    if 'memory_states' in training_state:
-        for i, block in enumerate(model.h):
-            if hasattr(block, 'cognitive'):
-                block.cognitive.memory_state = training_state['memory_states'][i]
-    
-    # 8. Create and load GradScaler
-    scaler = torch.amp.GradScaler()
-    scaler.load_state_dict(training_state['scaler'])
-    
-    return model, tokenizer, optimizer, scheduler, training_state['epoch'], training_state['train_loss_history'], scaler
-
-def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_loss_history=None):
+def train_enhanced_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_loss_history=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
-    # Create DataLoader with gradient accumulation
-    effective_batch_size = config.batch_size * config.gradient_accumulation_steps
     train_loader = DataLoader(
         dataset, 
         batch_size=config.batch_size, 
@@ -834,96 +642,67 @@ def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_
         pin_memory=True
     )
     
-    # Initialize optimizer with gradient clipping
     optimizer = AdamW(
         model.parameters(),
         lr=config.learning_rate,
-        eps=1e-8,  # Increased epsilon for numerical stability
-        weight_decay=0.01  # L2 regularization to prevent extreme weights
+        eps=1e-8,
+        weight_decay=0.01
     )
     
     num_training_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
-    warmup_steps = min(1000, num_training_steps // 10)  # Dynamic warmup
+    num_warmup_steps = int(num_training_steps * config.warmup_ratio)
     
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=warmup_steps,
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
     )
     
     if train_loss_history is None:
         train_loss_history = []
     
-    # Initialize gradient norm tracking
-    grad_norm_moving_avg = 0.0
-    beta = 0.98  # For exponential moving average
+    scaler = torch.amp.GradScaler()
     
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
         total_loss = 0
-        optimizer.zero_grad()
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
         
         for step, batch in enumerate(progress_bar):
-            try:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                
-                # Forward pass
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            with torch.amp.autocast('cuda'):
                 outputs = model(
                     input_ids, 
                     attention_mask=attention_mask, 
                     labels=labels
                 )
                 loss = outputs['loss'] / config.gradient_accumulation_steps
-                
-                # Check for NaN loss before backward pass
-                if torch.isnan(loss).any() or torch.isinf(loss).any():
-                    print(f"NaN/Inf detected in loss at step {step}. Skipping batch.")
-                    continue
-                
-                # Backward pass
-                loss.backward()
-                
-                # Gradient accumulation
-                if (step + 1) % config.gradient_accumulation_steps == 0:
-                    # Calculate gradient norm
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    
-                    # Update gradient norm moving average
-                    grad_norm_moving_avg = beta * grad_norm_moving_avg + (1 - beta) * grad_norm
-                    
-                    # Adjust learning rate based on gradient norm
-                    if grad_norm_moving_avg > config.max_grad_norm:
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] *= 0.9
-                    
-                    # Step optimizer and scheduler
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                
-                # Update progress bar
-                current_lr = scheduler.get_last_lr()[0]
-                progress_bar.set_postfix({
-                    'loss': f"{loss.item() * config.gradient_accumulation_steps:.4f}",
-                    'lr': f"{current_lr:.2e}",
-                    'grad_norm': f"{grad_norm_moving_avg:.2f}",
-                })
-                
-                total_loss += loss.item() * config.gradient_accumulation_steps
-                
-            except RuntimeError as e:
-                print(f"Error during training: {str(e)}")
-                continue
+            
+            scaler.scale(loss).backward()
+            
+            if (step + 1) % config.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            total_loss += loss.item() * config.gradient_accumulation_steps
+            
+            progress_bar.set_postfix({
+                'loss': f"{loss.item() * config.gradient_accumulation_steps:.4f}",
+                'lr': f"{scheduler.get_last_lr()[0]:.2e}",
+            })
         
         avg_loss = total_loss / len(train_loader)
         train_loss_history.append(avg_loss)
         print(f"Epoch {epoch+1}/{config.num_epochs}, Average Loss: {avg_loss:.4f}")
         
-        # Save checkpoint
         save_enhanced_model(
             model=model,
             optimizer=optimizer,
@@ -932,12 +711,71 @@ def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_
             config=config,
             epoch=epoch+1,
             train_loss_history=train_loss_history,
+            scaler=scaler,
             path=f"checkpoint_epoch_{epoch+1}"
         )
     
-    return model, train_loss_history, scheduler, optimizer
+    return model, train_loss_history, scheduler, optimizer, scaler
 
+def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, train_loss_history, scaler, path):
+    os.makedirs(path, exist_ok=True)
+    
+    model_to_save = model.module if hasattr(model, 'module') else model
+    model_to_save.save_pretrained(path, safe_serialization=False)  # Add safe_serialization=False
+    tokenizer.save_pretrained(path)
+    config.save_pretrained(path)
+    
+    torch.save({
+        'epoch': epoch,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'train_loss_history': train_loss_history,
+        'scaler': scaler.state_dict(),
+    }, os.path.join(path, 'training_state.bin'))
+    
+    print(f"Model and training state successfully saved to {path}")
 
+def load_enhanced_model(path, training=False):
+    import os
+    from transformers import GPT2Tokenizer
+    import torch
+    
+    # 1. Load config and model
+    config = EnhancedDecoderOnlyConfig.from_pretrained(path)
+    
+    # Create a new model instance
+    model = EnhancedDecoderOnlyGPT(config)
+    
+    # Load the state dict
+    state_dict = torch.load(os.path.join(path, 'pytorch_model.bin'), map_location='cpu')
+    
+    # Try to load the state dict, ignoring mismatched keys
+    model.load_state_dict(state_dict, strict=False)
+    
+    print(f"Loaded model from {path}")
+    
+    # 2. Load tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(path)
+    
+    if not training:
+        return model, tokenizer
+    
+    training_state = torch.load(os.path.join(path, 'training_state.bin'))
+    
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer.load_state_dict(training_state['optimizer_state_dict'])
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(config.warmup_ratio * config.num_training_steps),
+        num_training_steps=config.num_training_steps
+    )
+    scheduler.load_state_dict(training_state['scheduler_state_dict'])
+    
+    scaler = torch.amp.GradScaler()
+    scaler.load_state_dict(training_state['scaler'])
+    
+    return model, tokenizer, optimizer, scheduler, training_state['epoch'], training_state['train_loss_history'], scaler
 
 class WikipediaDataset(Dataset):
     def __init__(self, tokenizer: GPT2Tokenizer, max_length: int = 512, num_examples: int = None, min_length: int = 50):
@@ -946,14 +784,14 @@ class WikipediaDataset(Dataset):
         self.min_length = min_length
 
         # Load and preprocess Wikipedia dataset
-        dataset = load_dataset("wikipedia", "20220301.en", split="train[:2%]")
+        dataset = load_dataset("wikipedia", "20220301.en", split="train[:200]")
         
         # Text splitter with overlapping chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=max_length,
             chunk_overlap=50,  # Overlap to keep coherence
             length_function=len,
-            separators=["\n\n", "\n"]
+            separators=["\n\n", "\n", "."]
         )
         
         self.texts = []
@@ -995,12 +833,11 @@ class WikipediaDataset(Dataset):
         }
 
 
-
 def main(num_examples=None, resume_from=None):
     # Training configuration
     training_config = {
         'batch_size': 1,
-        'num_epochs': 4,
+        'num_epochs': 3,
         'learning_rate': 1e-4,
         'warmup_steps': 100,
         'max_length': 512,
@@ -1017,7 +854,7 @@ def main(num_examples=None, resume_from=None):
         )
     else:
         print("Initializing new model")
-        config = DecoderOnlyConfig(
+        config = EnhancedDecoderOnlyConfig(
             vocab_size=tokenizer.vocab_size,
             n_positions=512,
             n_embd=512,
@@ -1025,7 +862,7 @@ def main(num_examples=None, resume_from=None):
             n_head=8,
             n_inner=1536*2,
             learning_rate=training_config['learning_rate'], 
-            gradient_accumulation_steps=8,
+            gradient_accumulation_steps=4,
             max_grad_norm=1.0,
             warmup_ratio=0.1,
             use_moe=True,
@@ -1038,7 +875,7 @@ def main(num_examples=None, resume_from=None):
             batch_size=training_config['batch_size'],
             warmup_steps=training_config['warmup_steps'],
         )
-        model = ImprovedDecoderOnlyGPT(config)
+        model = EnhancedDecoderOnlyGPT(config)
         start_epoch = 0
         train_loss_history = None
 
@@ -1050,7 +887,7 @@ def main(num_examples=None, resume_from=None):
     )
 
     # Train the model
-    model, train_loss_history, scheduler, optimizer = train_chatbot_model(
+    model, train_loss_history, scheduler, optimizer, scaler = train_enhanced_chatbot_model(
         model=model,
         tokenizer=tokenizer,
         dataset=dataset,
@@ -1067,6 +904,7 @@ def main(num_examples=None, resume_from=None):
             tokenizer=tokenizer,
             config=config,
             epoch=config.num_epochs,
+            scaler=scaler,
             train_loss_history=train_loss_history,
             path="final_enhanced_wikipedia_chatbot"
     )

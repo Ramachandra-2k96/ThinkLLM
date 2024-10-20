@@ -17,86 +17,7 @@ from transformers import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
-
-class AdaptiveInputEmbedding(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.adaptive_span = nn.Parameter(torch.ones(config.vocab_size))
-        self.base_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.context_projector = nn.Linear(config.n_embd, config.n_embd)
-        
-    def forward(self, input_ids):
-        # Get base embeddings
-        base_embeds = self.base_embedding(input_ids)
-        
-        # Apply adaptive span attention
-        span_weights = F.softmax(self.adaptive_span, dim=0)
-        span_weights = span_weights[input_ids].unsqueeze(-1)
-        
-        # Project embeddings based on context
-        context_embeds = self.context_projector(base_embeds)
-        
-        # Combine adaptively
-        return span_weights * context_embeds + (1 - span_weights) * base_embeds
-    
-class HierarchicalCompression(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.compression_layers = nn.ModuleList([
-            nn.Conv1d(config.n_embd, config.n_embd, kernel_size=2, stride=1, padding=1)
-            for _ in range(3)  # 3 levels of compression
-        ])
-        self.decompression_layers = nn.ModuleList([
-            nn.ConvTranspose1d(config.n_embd, config.n_embd, kernel_size=2, stride=1, padding=1)
-            for _ in range(3)
-        ])
-        
-    def forward(self, hidden_states):
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # Compress
-        x = hidden_states.transpose(1, 2)  # [batch, hidden, seq]
-        compressed_features = []
-        for layer in self.compression_layers:
-            x = F.gelu(layer(x))
-            compressed_features.append(x)
-        
-        # Decompress
-        for i, layer in enumerate(self.decompression_layers):
-            x = F.gelu(layer(x))
-            if i < len(compressed_features) - 1:
-                x = x + compressed_features[-(i+2)]  # Skip connections
-                
-        return x.transpose(1, 2)  # [batch, seq, hidden]
-    
-class SemanticMemoryModule(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.num_concepts = 1000
-        self.concept_dim = config.n_embd
-        
-        # Learnable concept embeddings
-        self.concept_embeddings = nn.Parameter(
-            torch.randn(self.num_concepts, self.concept_dim)
-        )
-        
-        self.concept_projector = nn.Linear(config.n_embd, self.concept_dim)
-        self.output_projector = nn.Linear(self.concept_dim, config.n_embd)
-        
-    def forward(self, hidden_states):
-        # Project hidden states to concept space
-        projected_states = self.concept_projector(hidden_states)
-        
-        # Compute attention with concepts
-        attention_scores = torch.matmul(projected_states, self.concept_embeddings.t())
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        
-        # Weighted sum of concepts
-        concept_mixture = torch.matmul(attention_probs, self.concept_embeddings)
-        
-        # Project back to hidden space
-        return self.output_projector(concept_mixture)
-    
+from transformers.generation.utils import GenerationMixin
 
 class CognitiveLayer(nn.Module):
     def __init__(self, config):
@@ -385,16 +306,13 @@ class MixtureOfExperts(nn.Module):
         
         return output
     
-class ImprovedDecoderOnlyBlock(nn.Module):
+# Update the DecoderOnlyBlock class
+class DecoderOnlyBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.attn = DecoderOnlyAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        
-        # Enhanced components
-        self.hierarchical_comp = HierarchicalCompression(config)
-        self.semantic_memory = SemanticMemoryModule(config)
         
         if config.use_moe:
             self.mlp = MixtureOfExperts(config)
@@ -414,14 +332,6 @@ class ImprovedDecoderOnlyBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         
-        # Apply hierarchical compression
-        compressed_states = self.hierarchical_comp(hidden_states)
-        hidden_states = hidden_states + compressed_states
-        
-        # Apply semantic memory
-        semantic_states = self.semantic_memory(hidden_states)
-        hidden_states = hidden_states + semantic_states
-        
         attn_outputs = self.attn(
             hidden_states,
             attention_mask=attention_mask,
@@ -429,7 +339,6 @@ class ImprovedDecoderOnlyBlock(nn.Module):
             past_key_value=past_key_value
         )
         
-        # Rest of the forward pass remains the same
         if isinstance(attn_outputs, tuple):
             attn_output = attn_outputs[0]
             present_key_value = attn_outputs[1] if len(attn_outputs) > 1 else None
@@ -465,26 +374,23 @@ class ImprovedDecoderOnlyBlock(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
             
-        return hidden_states, new_memory_state, present_key_value if use_cache else None
+        return outputs
 
-class ImprovedDecoderOnlyGPT(PreTrainedModel):
+# Update the DecoderOnlyGPT class
+class DecoderOnlyGPT(PreTrainedModel,GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
         
-        # Replace standard embedding with adaptive embedding
-        self.wte = AdaptiveInputEmbedding(config)
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
         self.drop = nn.Dropout(config.embd_pdrop)
-        
-        # Use improved decoder blocks
-        self.h = nn.ModuleList([ImprovedDecoderOnlyBlock(config) for _ in range(config.n_layer)])
-        
+        self.h = nn.ModuleList([DecoderOnlyBlock(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         
         if config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-            self.lm_head.weight = self.wte.base_embedding.weight
+            self.lm_head.weight = self.wte.weight
         else:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
             
@@ -590,69 +496,6 @@ class ImprovedDecoderOnlyGPT(PreTrainedModel):
             "all_hidden_states": all_hidden_states,
             "all_attentions": all_attentions,
         }
-    def generate(self, input_ids, attention_mask=None, max_length=100, temperature=1.0, top_k=0, top_p=0.9, repetition_penalty=1.0, do_sample=True, pad_token_id=None):
-        device = input_ids.device
-        batch_size = input_ids.size(0)
-
-        if pad_token_id is None:
-            pad_token_id = self.config.eos_token_id
-
-        generated = input_ids.clone()
-        past_key_values = None
-        memory_states = [None] * len(self.h)
-
-        for _ in range(max_length - input_ids.size(1)):
-            outputs = self(generated, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True)
-            logits = outputs['logits'][:, -1, :] / temperature
-            past_key_values = outputs.get('presents', None)
-
-            # Update memory states
-            memory_states = outputs.get('memory_states', memory_states)
-
-            # Apply repetition penalty
-            if repetition_penalty != 1.0:
-                for i in range(batch_size):
-                    for token_id in set(generated[i].tolist()):
-                        logits[i, token_id] /= repetition_penalty
-
-            # Apply top-k and top-p filtering
-            filtered_logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
-
-            if do_sample:
-                probs = F.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(filtered_logits, dim=-1).unsqueeze(-1)
-
-            generated = torch.cat([generated, next_token], dim=1)
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((batch_size, 1))], dim=1) if attention_mask is not None else None
-
-            if next_token.item() == pad_token_id:
-                break
-
-        return generated
-
-def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
-    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering """
-    top_k = min(top_k, logits.size(-1))  # Safety check
-    if top_k > 0:
-        # Remove all tokens with a probability less than the last token of the top-k
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-        logits[indices_to_remove] = filter_value
-
-    if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-        # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift the indices to the right to keep also the first token above the threshold
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        logits[indices_to_remove] = filter_value
-    return logits
 
 def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, train_loss_history, path):
     try:
@@ -711,7 +554,7 @@ def save_enhanced_model(model, optimizer, scheduler, tokenizer, config, epoch, t
 def load_enhanced_model(path, training=False):
     # 1. Load config and model
     config = DecoderOnlyConfig.from_pretrained(path)
-    model = ImprovedDecoderOnlyGPT.from_pretrained(path, config=config)
+    model = DecoderOnlyGPT.from_pretrained(path, config=config)
     
     # 2. Load tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(path)
@@ -767,7 +610,7 @@ def load_enhanced_model(path, training=False):
     
     # 1. Load config and model
     config = DecoderOnlyConfig.from_pretrained(path)
-    model = ImprovedDecoderOnlyGPT.from_pretrained(path, config=config)
+    model = DecoderOnlyGPT.from_pretrained(path, config=config)
     
     # 2. Load tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(path)
@@ -937,8 +780,6 @@ def train_chatbot_model(model, tokenizer, dataset, config, start_epoch=0, train_
     
     return model, train_loss_history, scheduler, optimizer
 
-
-
 class WikipediaDataset(Dataset):
     def __init__(self, tokenizer: GPT2Tokenizer, max_length: int = 512, num_examples: int = None, min_length: int = 50):
         self.tokenizer = tokenizer
@@ -953,7 +794,7 @@ class WikipediaDataset(Dataset):
             chunk_size=max_length,
             chunk_overlap=50,  # Overlap to keep coherence
             length_function=len,
-            separators=["\n\n", "\n"]
+            separators=["\n\n", "\n", "."]
         )
         
         self.texts = []
@@ -995,12 +836,11 @@ class WikipediaDataset(Dataset):
         }
 
 
-
 def main(num_examples=None, resume_from=None):
     # Training configuration
     training_config = {
-        'batch_size': 1,
-        'num_epochs': 4,
+        'batch_size': 2,
+        'num_epochs': 3,
         'learning_rate': 1e-4,
         'warmup_steps': 100,
         'max_length': 512,
@@ -1023,9 +863,9 @@ def main(num_examples=None, resume_from=None):
             n_embd=512,
             n_layer=6,
             n_head=8,
-            n_inner=1536*2,
+            n_inner=1536,
             learning_rate=training_config['learning_rate'], 
-            gradient_accumulation_steps=8,
+            gradient_accumulation_steps=4,
             max_grad_norm=1.0,
             warmup_ratio=0.1,
             use_moe=True,
@@ -1038,7 +878,7 @@ def main(num_examples=None, resume_from=None):
             batch_size=training_config['batch_size'],
             warmup_steps=training_config['warmup_steps'],
         )
-        model = ImprovedDecoderOnlyGPT(config)
+        model = DecoderOnlyGPT(config)
         start_epoch = 0
         train_loss_history = None
 
